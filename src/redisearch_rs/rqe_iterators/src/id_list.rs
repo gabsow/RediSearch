@@ -11,12 +11,13 @@
 
 use index_result::{RSIndexResult, RawIndexResult};
 use index_spec::IndexSpecReadGuard;
-use ref_mode::{Active, Ref};
+use ref_mode::{Active, Ref, Suspended};
 use rqe_core::DocId;
 use std::cmp::Ordering;
 
 use crate::{
-    IteratorType, RQEIterator, RQEIteratorError, RQEValidateStatus, SkipToOutcome,
+    IteratorType, RQEIterator, RQEIteratorBoxed, RQEIteratorError, RQESuspendedIterator,
+    RQEValidateStatus, ResumeOutcome, SkipToOutcome,
     deferred::{ProducedResults, Producer},
     profile_print::{ProfilePrint, ProfilePrintCtx},
     utils::OwnedSlice,
@@ -307,6 +308,11 @@ impl<const SORTED: bool> ProfilePrint for IdList<'_, SORTED> {
 ///
 /// Once produced it delegates entirely to the wrapped [`IdList`], so it reports the same
 /// [`IteratorType`] and is interchangeable with an eagerly-built one.
+///
+/// `#[repr(C)]` so it is layout-compatible with its suspended counterpart
+/// [`IdListLazySuspended`], enabling the allocation-preserving whole-struct cast
+/// in [`RQEIteratorBoxed::suspend`].
+#[repr(C)]
 pub struct IdListLazy<'index, const SORTED: bool> {
     /// The wrapped ID list, empty until [`producer`](Self::producer) runs.
     inner: IdList<'index, SORTED>,
@@ -418,5 +424,121 @@ impl<'index, const SORTED: bool> RQEIterator<'index> for IdListLazy<'index, SORT
 impl<const SORTED: bool> ProfilePrint for IdListLazy<'_, SORTED> {
     fn print_profile(&self, map: &mut redis_reply::MapBuilder<'_>, ctx: &mut ProfilePrintCtx<'_>) {
         self.inner.print_profile(map, ctx);
+    }
+}
+
+impl<Rf: Ref, const SORTED: bool> RawIdList<Rf, SORTED> {
+    /// Read `result.doc_id` without exposing the private `result` field to
+    /// other modules. Used by [`Metric`](crate::metric::Metric)'s
+    /// [`RQESuspendedIterator`] impl, which can't reach into the inner
+    /// `RawIdList` directly.
+    pub(crate) const fn suspended_result_doc_id(s: &Self) -> DocId {
+        s.result.doc_id
+    }
+}
+
+impl<'index, const SORTED: bool> RQEIteratorBoxed<'index> for IdList<'index, SORTED> {
+    type Suspended = RawIdList<Suspended, SORTED>;
+
+    fn suspend(self: Box<Self>) -> Box<Self::Suspended> {
+        let raw = Box::into_raw(self);
+        // SAFETY: `RawIdList` is `#[repr(C)]`. The only `Rf`-dependent field
+        // is `result: RawIndexResult<Rf>`, layout-compatible across `Rf` via
+        // `SharedPtr` transparency. The other fields (`ids: OwnedSlice<...>`,
+        // `offset: usize`) carry no `Rf`. Suspend is widening, so casting
+        // the box's heap pointer to the suspended counterpart is sound and
+        // preserves the box's heap allocation.
+        unsafe { Box::from_raw(raw as *mut RawIdList<Suspended, SORTED>) }
+    }
+}
+
+impl<const SORTED: bool> RQESuspendedIterator for RawIdList<Suspended, SORTED> {
+    type Resumed<'a> = IdList<'a, SORTED>;
+
+    fn resume<'a>(
+        self: Box<Self>,
+        _guard: &'a IndexSpecReadGuard<'a>,
+    ) -> Result<ResumeOutcome<Box<Self::Resumed<'a>>>, RQEIteratorError> {
+        let raw = Box::into_raw(self);
+        // SAFETY: layout-compatible — see `suspend`. `IdList` owns its data
+        // entirely (the `OwnedSlice<DocId>`) and the virtual `result` has
+        // no aliased pointers, so promoting back to `Active<'a>` is
+        // unconditionally sound. Box::from_raw reuses the same heap
+        // allocation as suspend's Box::into_raw.
+        let active = unsafe { Box::from_raw(raw as *mut IdList<'a, SORTED>) };
+        Ok(ResumeOutcome::Ok(active))
+    }
+
+    fn last_doc_id(&self) -> DocId {
+        Self::suspended_result_doc_id(self)
+    }
+}
+
+/// `'static`-typed suspended counterpart of [`IdListLazy`], used as its
+/// [`RQEIteratorBoxed::Suspended`] type.
+///
+/// Layout-compatible with [`IdListLazy`] — both are `#[repr(C)]` with the same
+/// field order. The inner `RawIdList<Suspended, _>` is layout-compatible with the
+/// active `RawIdList<Active, _>` (see [`IdList`]'s [`RQEIteratorBoxed::suspend`]),
+/// and `Producer<'static>` is byte-identical to `Producer<'index>` (a boxed trait
+/// object is two pointers regardless of lifetime). The `'static` on the producer
+/// is a **lifetime lie**: the deferred producer captures only raw C pointers and C
+/// function pointers (never Rust references — see the `NewLazyVectorRangeIterator`
+/// FFI constructor), so widening its lifetime is a no-op on the actual bytes. The
+/// lie is closed by the FFI-side lock discipline: while suspended, nothing runs the
+/// producer, and [`resume`] contracts the lifetime back to the guard's `'a`.
+#[repr(C)]
+pub struct IdListLazySuspended<const SORTED: bool> {
+    inner: RawIdList<Suspended, SORTED>,
+    producer: Producer<'static>,
+    produced: bool,
+    num_estimated_hint: usize,
+}
+
+impl<'index, const SORTED: bool> RQEIteratorBoxed<'index> for IdListLazy<'index, SORTED> {
+    type Suspended = IdListLazySuspended<SORTED>;
+
+    fn suspend(self: Box<Self>) -> Box<Self::Suspended> {
+        let raw = Box::into_raw(self);
+        // SAFETY: `IdListLazy` and `IdListLazySuspended` are both `#[repr(C)]` with
+        // identical field layout: the inner `RawIdList<Active, _>` is layout-compatible
+        // with `RawIdList<Suspended, _>` (see `IdList::suspend`), `Producer<'index>`
+        // and `Producer<'static>` are both two-pointer boxed trait objects, and
+        // `produced`/`num_estimated_hint` carry no lifetime. Widening the producer's
+        // lifetime from `'index` to `'static` is sound because the producer holds only
+        // raw C pointers (no Rust references); the lie is closed at `resume`. Casting
+        // the box's heap pointer preserves the allocation, so any interior pointers
+        // into the inner list's result stay valid across the suspend/resume cycle.
+        unsafe { Box::from_raw(raw as *mut IdListLazySuspended<SORTED>) }
+    }
+}
+
+impl<const SORTED: bool> RQESuspendedIterator for IdListLazySuspended<SORTED> {
+    type Resumed<'a> = IdListLazy<'a, SORTED>;
+
+    fn resume<'a>(
+        self: Box<Self>,
+        _guard: &'a IndexSpecReadGuard<'a>,
+    ) -> Result<ResumeOutcome<Box<Self::Resumed<'a>>>, RQEIteratorError> {
+        let raw = Box::into_raw(self);
+        // SAFETY: layout-compatible — see `suspend`. Contracting the producer's
+        // lifetime back from `'static` to `'a` restores the original borrow; the
+        // caller's read lock on the guard witnesses that the producer's raw C context
+        // is still valid. The inner list owns all its data (the `OwnedSlice<DocId>`)
+        // and the virtual result has no aliased pointers, so promoting it back to
+        // `Active<'a>` is unconditionally sound. `Box::from_raw` reuses the same heap
+        // allocation as `suspend`'s `Box::into_raw`.
+        let active = unsafe { Box::from_raw(raw as *mut IdListLazy<'a, SORTED>) };
+        Ok(ResumeOutcome::Ok(active))
+    }
+
+    fn last_doc_id(&self) -> DocId {
+        RawIdList::<Suspended, SORTED>::suspended_result_doc_id(&self.inner)
+    }
+
+    fn num_estimated(&self) -> usize {
+        // Snapshot from construction; the real count is only known once the producer
+        // has run. Acceptable for the FFI display-only consumer.
+        self.num_estimated_hint
     }
 }
