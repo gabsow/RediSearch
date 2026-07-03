@@ -337,7 +337,10 @@ impl<'index, S: ScoreSource + 'index, C: RQEIterator<'index> + 'index> TopKItera
             let reranked = entries
                 .into_iter()
                 .zip(scored)
-                .map(|(entry, scored)| HeapResult { scored, record: entry.record });
+                .map(|(entry, scored)| HeapResult {
+                    scored,
+                    record: entry.record,
+                });
             self.heap.rebuild_from(reranked);
         }
 
