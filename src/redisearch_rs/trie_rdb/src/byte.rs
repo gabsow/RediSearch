@@ -13,7 +13,7 @@
 //! wrapper delegates to it. The wire format and framing rules are documented
 //! on the crate root.
 
-use super::{RdbError, RdbOpts, RdbRead, RdbWrite, load_with, save_nul_terminated};
+use super::{RdbError, RdbIO, RdbOpts, load_with, save_nul_terminated};
 use crate::TrieEntry;
 use trie_rs::TrieMap;
 
@@ -24,21 +24,17 @@ use trie_rs::TrieMap;
 /// match the C wire format (the loader strips it back off). One scratch
 /// buffer is reused across all entries so the per-key NUL padding costs
 /// at most one allocation per save call.
-pub fn save<W: RdbWrite>(map: &TrieMap<TrieEntry>, writer: &mut W, opts: RdbOpts) {
-    writer.save_u64(map.n_unique_keys() as u64);
+pub fn save<IO: RdbIO>(map: &TrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
+    io.save_u64(map.n_unique_keys() as u64);
     let mut scratch = Vec::new();
     for (key, entry) in map.iter() {
-        save_nul_terminated(writer, &mut scratch, &key);
-        writer.save_f64(entry.score);
+        save_nul_terminated(io, &mut scratch, &key);
+        io.save_f64(entry.score);
         if opts.payloads {
-            save_nul_terminated(
-                writer,
-                &mut scratch,
-                entry.payload.as_deref().unwrap_or(&[]),
-            );
+            save_nul_terminated(io, &mut scratch, entry.payload.as_deref().unwrap_or(&[]));
         }
         if opts.num_docs {
-            writer.save_u64(entry.num_docs);
+            io.save_u64(entry.num_docs);
         }
     }
 }
@@ -50,9 +46,9 @@ pub fn save<W: RdbWrite>(map: &TrieMap<TrieEntry>, writer: &mut W, opts: RdbOpts
 /// The trailing NUL byte is stripped from every key (and every payload
 /// when [`RdbOpts::payloads`] is set). An empty payload (i.e. a single-NUL
 /// buffer, `"\0"`) is normalized to `payload: None`.
-pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<TrieMap<TrieEntry>, RdbError> {
+pub fn load<IO: RdbIO>(io: &mut IO, opts: RdbOpts) -> Result<TrieMap<TrieEntry>, RdbError> {
     let mut map = TrieMap::new();
-    load_with(reader, opts, Ok, |key, entry| {
+    load_with(io, opts, Ok, |key, entry| {
         map.insert(&key, entry);
     })?;
     Ok(map)
@@ -61,7 +57,7 @@ pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<TrieMap<TrieEnt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{Op, Recorder, Replayer};
+    use crate::test_helpers::{Op, RdbMock};
 
     fn entry(score: f64, payload: Option<&[u8]>, num_docs: u64) -> TrieEntry {
         TrieEntry {
@@ -72,18 +68,17 @@ mod tests {
     }
 
     fn round_trip(map: &TrieMap<TrieEntry>, opts: RdbOpts) -> TrieMap<TrieEntry> {
-        let mut rec = Recorder::default();
-        save(map, &mut rec, opts);
-        let mut rep = Replayer::new(rec.0);
-        load(&mut rep, opts).expect("load should succeed")
+        let mut mock = RdbMock::default();
+        save(map, &mut mock, opts);
+        load(&mut mock, opts).expect("load should succeed")
     }
 
     #[test]
     fn save_empty_map() {
         let map: TrieMap<TrieEntry> = TrieMap::new();
-        let mut rec = Recorder::default();
-        save(&map, &mut rec, RdbOpts::default());
-        assert_eq!(rec.0, vec![Op::U64(0)]);
+        let mut mock = RdbMock::default();
+        save(&map, &mut mock, RdbOpts::default());
+        assert_eq!(mock.ops, vec![Op::U64(0)]);
     }
 
     #[test]
@@ -91,10 +86,10 @@ mod tests {
         let mut map = TrieMap::new();
         map.insert(b"alpha", entry(1.0, None, 0));
         map.insert(b"beta", entry(2.5, None, 0));
-        let mut rec = Recorder::default();
-        save(&map, &mut rec, RdbOpts::default());
+        let mut mock = RdbMock::default();
+        save(&map, &mut mock, RdbOpts::default());
         assert_eq!(
-            rec.0,
+            mock.ops,
             vec![
                 Op::U64(2),
                 Op::Bytes(b"alpha\0".to_vec()),
@@ -109,17 +104,17 @@ mod tests {
     fn save_protocol_shape_with_all_opts() {
         let mut map = TrieMap::new();
         map.insert(b"x", entry(1.0, Some(b"pay"), 7));
-        let mut rec = Recorder::default();
+        let mut mock = RdbMock::default();
         save(
             &map,
-            &mut rec,
+            &mut mock,
             RdbOpts {
                 payloads: true,
                 num_docs: true,
             },
         );
         assert_eq!(
-            rec.0,
+            mock.ops,
             vec![
                 Op::U64(1),
                 Op::Bytes(b"x\0".to_vec()),
@@ -194,10 +189,10 @@ mod tests {
         for key in [b"zebra".as_slice(), b"apple", b"mango", b"banana"] {
             map.insert(key, entry(1.0, None, 0));
         }
-        let mut rec = Recorder::default();
-        save(&map, &mut rec, RdbOpts::default());
-        let keys: Vec<Vec<u8>> = rec
-            .0
+        let mut mock = RdbMock::default();
+        save(&map, &mut mock, RdbOpts::default());
+        let keys: Vec<Vec<u8>> = mock
+            .ops
             .into_iter()
             .filter_map(|op| match op {
                 Op::Bytes(mut b) => {
@@ -229,16 +224,16 @@ mod tests {
             payloads: true,
             num_docs: false,
         };
-        let mut rec_empty = Recorder::default();
-        let mut rec_none = Recorder::default();
+        let mut rec_empty = RdbMock::default();
+        let mut rec_none = RdbMock::default();
         save(&from_empty, &mut rec_empty, opts);
         save(&from_none, &mut rec_none, opts);
         assert_eq!(
-            rec_empty.0, rec_none.0,
+            rec_empty.ops, rec_none.ops,
             "empty Vec and None must match on the wire"
         );
 
-        let loaded = load(&mut Replayer::new(rec_empty.0), opts).unwrap();
+        let loaded = load(&mut rec_empty, opts).unwrap();
         assert_eq!(loaded.find(b"k").unwrap().payload, None);
     }
 
@@ -246,16 +241,16 @@ mod tests {
     fn trailing_nul_on_every_bytes_op() {
         let mut map = TrieMap::new();
         map.insert(b"abc", entry(1.0, Some(b"def"), 1));
-        let mut rec = Recorder::default();
+        let mut mock = RdbMock::default();
         save(
             &map,
-            &mut rec,
+            &mut mock,
             RdbOpts {
                 payloads: true,
                 num_docs: true,
             },
         );
-        for op in &rec.0 {
+        for op in &mock.ops {
             if let Op::Bytes(b) = op {
                 assert_eq!(b.last(), Some(&0), "bytes op missing trailing NUL: {b:?}");
             }
@@ -266,11 +261,11 @@ mod tests {
     fn io_error_propagates() {
         let mut map = TrieMap::new();
         map.insert(b"a", entry(1.0, None, 0));
-        let mut rec = Recorder::default();
+        let mut rec = RdbMock::default();
         save(&map, &mut rec, RdbOpts::default());
         // Ops: U64(1), Bytes("a\0"), F64(1.0). Inject an error after the count read.
-        let mut rep = Replayer::fail_after(rec.0, 1);
-        let err = load(&mut rep, RdbOpts::default()).unwrap_err();
+        let mut mock = RdbMock::from_ops(rec.ops).fail_after(1);
+        let err = load(&mut mock, RdbOpts::default()).unwrap_err();
         assert_eq!(err, RdbError::Io);
     }
 
@@ -293,7 +288,7 @@ mod tests {
             Op::Bytes(b"abc".to_vec()), // missing trailing NUL
             Op::F64(1.0),
         ];
-        let err = load(&mut Replayer::new(ops), RdbOpts::default()).unwrap_err();
+        let err = load(&mut RdbMock::from_ops(ops), RdbOpts::default()).unwrap_err();
         assert_eq!(err, RdbError::MissingTrailingNul);
     }
 }

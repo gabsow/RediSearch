@@ -17,7 +17,7 @@
 //! [`RdbError::InvalidUtf8`] rather than silently materializing as an
 //! ill-formed `String`.
 
-use super::{RdbError, RdbOpts, RdbRead, RdbWrite, byte, load_with};
+use super::{RdbError, RdbIO, RdbOpts, byte, load_with};
 use crate::TrieEntry;
 use trie_rs::str_trie_map::StrTrieMap;
 
@@ -26,8 +26,8 @@ use trie_rs::str_trie_map::StrTrieMap;
 ///
 /// Delegates to [`crate::byte::save`] on the inner byte-keyed
 /// [`trie_rs::TrieMap`]; the wire output is byte-identical.
-pub fn save<W: RdbWrite>(map: &StrTrieMap<TrieEntry>, writer: &mut W, opts: RdbOpts) {
-    byte::save(map.byte_trie(), writer, opts);
+pub fn save<IO: RdbIO>(map: &StrTrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
+    byte::save(map.byte_trie(), io, opts);
 }
 
 /// Deserialize a [`StrTrieMap<TrieEntry>`] from `reader`.
@@ -35,10 +35,10 @@ pub fn save<W: RdbWrite>(map: &StrTrieMap<TrieEntry>, writer: &mut W, opts: RdbO
 /// `opts` must match the [`RdbOpts`] used at save time. Each loaded key
 /// buffer is UTF-8 validated; on failure the load aborts with
 /// [`RdbError::InvalidUtf8`].
-pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<StrTrieMap<TrieEntry>, RdbError> {
+pub fn load<IO: RdbIO>(io: &mut IO, opts: RdbOpts) -> Result<StrTrieMap<TrieEntry>, RdbError> {
     let mut map = StrTrieMap::new();
     load_with(
-        reader,
+        io,
         opts,
         |bytes| String::from_utf8(bytes).map_err(|_| RdbError::InvalidUtf8),
         |key, entry| {
@@ -51,7 +51,7 @@ pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<StrTrieMap<Trie
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{Op, Recorder, Replayer};
+    use crate::test_helpers::{Op, RdbMock};
 
     fn entry(score: f64, payload: Option<&[u8]>, num_docs: u64) -> TrieEntry {
         TrieEntry {
@@ -70,9 +70,9 @@ mod tests {
             payloads: true,
             num_docs: true,
         };
-        let mut rec = Recorder::default();
-        save(&map, &mut rec, opts);
-        let loaded = load(&mut Replayer::new(rec.0), opts).expect("load should succeed");
+        let mut mock = RdbMock::default();
+        save(&map, &mut mock, opts);
+        let loaded = load(&mut mock, opts).expect("load should succeed");
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.get("alpha"), Some(&entry(1.0, Some(b"p"), 3)));
         assert_eq!(loaded.get("héllo"), Some(&entry(2.5, None, 7)));
@@ -85,7 +85,7 @@ mod tests {
         // Use `match` rather than `unwrap_err`: `StrTrieMap` doesn't impl
         // `Debug`, and adding it just to satisfy the test would force a
         // `Data: Debug` bound on every map instantiation.
-        match load(&mut Replayer::new(ops), RdbOpts::default()) {
+        match load(&mut RdbMock::from_ops(ops), RdbOpts::default()) {
             Err(RdbError::InvalidUtf8) => {}
             Err(other) => panic!("expected InvalidUtf8, got {other:?}"),
             Ok(_) => panic!("expected InvalidUtf8 error, got Ok"),
@@ -106,10 +106,10 @@ mod tests {
             payloads: true,
             num_docs: true,
         };
-        let mut rec_str = Recorder::default();
-        let mut rec_bytes = Recorder::default();
+        let mut rec_str = RdbMock::default();
+        let mut rec_bytes = RdbMock::default();
         save(&str_map, &mut rec_str, opts);
         byte::save(&byte_map, &mut rec_bytes, opts);
-        assert_eq!(rec_str.0, rec_bytes.0);
+        assert_eq!(rec_str.ops, rec_bytes.ops);
     }
 }

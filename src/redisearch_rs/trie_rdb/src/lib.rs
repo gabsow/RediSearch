@@ -11,7 +11,7 @@
 //!
 //! Mirrors the wire format produced by the C functions `TrieType_GenericSave`
 //! and `TrieType_GenericLoad`. This crate owns the shared substrate —
-//! the [`RdbWrite`] / [`RdbRead`] IO traits, [`RdbOpts`], [`RdbError`], the
+//! the [`RdbIO`] IO trait, [`RdbOpts`], [`RdbError`], the
 //! NUL-framing helpers, and the [`load_with`] entry-stream reader — plus the
 //! [`TrieEntry`] value type it serializes. The two concrete serializers live
 //! alongside it:
@@ -20,10 +20,10 @@
 //! - [`mod@str`] — for the UTF-8-keyed [`trie_rs::str_trie_map::StrTrieMap`]`<TrieEntry>`,
 //!   a thin wrapper that delegates to [`byte`] and is byte-identical on the wire.
 //!
-//! IO is abstracted behind the [`RdbWrite`] / [`RdbRead`] traits so this crate
-//! carries no Redis dependency: the C entrypoints implement them over
+//! IO is abstracted behind the [`RdbIO`] trait so this crate
+//! carries no Redis dependency: the C entrypoint implements it over
 //! `RedisModuleIO` (in the `trie_rdb_ffi` crate), and pure-Rust callers can
-//! implement them over any buffer.
+//! implement it over any buffer.
 //!
 //! # Wire format
 //!
@@ -36,7 +36,7 @@
 //! ] * count
 //! ```
 //!
-//! The diagram lists the framed primitives passed to [`RdbWrite`]; the actual
+//! The diagram lists the framed primitives passed to [`RdbIO`]; the actual
 //! on-wire bytes include length prefixes added by `RedisModule_Save*`, which
 //! are opaque to this layer.
 //!
@@ -47,7 +47,7 @@
 //! `SaveStringBuffer(..., len + 1)`) and the loader strips one byte. Buffers
 //! that do not end in NUL are rejected with [`RdbError::MissingTrailingNul`].
 //! NUL framing is applied in the algorithm body via [`save_nul_terminated`]
-//! and [`load_nul_terminated`]; the [`RdbWrite`] / [`RdbRead`] trait surface
+//! and [`load_nul_terminated`]; the [`RdbIO`] trait surface
 //! stays neutral — it just writes and reads raw length-prefixed buffers. A
 //! single scratch [`Vec<u8>`] is reused across every entry of a save, so the
 //! per-key NUL padding adds zero allocations after the first.
@@ -81,14 +81,14 @@ pub use entry::TrieEntry;
 /// raw key bytes become a key: `key_from_bytes` maps the NUL-stripped buffer
 /// into the caller's key type (identity for bytes, UTF-8 validation for str),
 /// and `insert` places the finished `(key, entry)` into the caller's map.
-pub(crate) fn load_with<R, K>(
-    reader: &mut R,
+pub(crate) fn load_with<IO, K>(
+    reader: &mut IO,
     opts: RdbOpts,
     mut key_from_bytes: impl FnMut(Vec<u8>) -> Result<K, RdbError>,
     mut insert: impl FnMut(K, TrieEntry),
 ) -> Result<(), RdbError>
 where
-    R: RdbRead,
+    IO: RdbIO,
 {
     let count = reader.load_u64()?;
     for _ in 0..count {
@@ -119,7 +119,7 @@ where
 ///
 /// `scratch` is borrowed from the caller so one allocation can amortize
 /// across an entire save loop.
-pub(crate) fn save_nul_terminated<W: RdbWrite>(writer: &mut W, scratch: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn save_nul_terminated<IO: RdbIO>(writer: &mut IO, scratch: &mut Vec<u8>, b: &[u8]) {
     scratch.clear();
     scratch.reserve(b.len() + 1);
     scratch.extend_from_slice(b);
@@ -131,7 +131,7 @@ pub(crate) fn save_nul_terminated<W: RdbWrite>(writer: &mut W, scratch: &mut Vec
 /// and return its contents with the trailing NUL stripped. Returns
 /// [`RdbError::MissingTrailingNul`] when the wire buffer is empty or does
 /// not end in `0x00`.
-pub(crate) fn load_nul_terminated<R: RdbRead>(reader: &mut R) -> Result<Vec<u8>, RdbError> {
+pub(crate) fn load_nul_terminated<IO: RdbIO>(reader: &mut IO) -> Result<Vec<u8>, RdbError> {
     let mut buf = reader.load_bytes()?;
     if buf.pop() != Some(0) {
         return Err(RdbError::MissingTrailingNul);
@@ -152,12 +152,28 @@ pub struct RdbOpts {
     pub num_docs: bool,
 }
 
-/// Sink for the typed RDB save primitives.
+/// Typed RDB IO endpoint: the save and load primitives for one trie payload.
 ///
-/// One method per primitive type — `RedisModule_Save*` is a typed framing
-/// API (length-prefixed buffers, fixed-width numbers) rather than a byte
-/// stream, so [`std::io::Write`] would not be a faithful abstraction.
-pub trait RdbWrite {
+/// One method per primitive type — `RedisModule_Save*` / `Load*` is a typed
+/// framing API (length-prefixed buffers, fixed-width numbers) rather than a
+/// byte stream, so [`std::io::Write`] / [`std::io::Read`] would not be a
+/// faithful abstraction.
+///
+/// Read and write live on one trait, not a split pair, because every
+/// implementor is bidirectional: the sole production impl wraps a single
+/// `RedisModuleIO` handle (passed to both the save and load callbacks), and
+/// the test mock round-trips through one buffer. Interface segregation would
+/// only pay off if a one-directional concrete type existed; none does. If a
+/// future call site genuinely needs a save-only or load-only bound, express it
+/// with a narrow local trait at that site rather than re-splitting `RdbIO`.
+///
+/// Saves are infallible, mirroring the void-returning `RedisModule_Save*`
+/// primitives (failures surface out-of-band via `RedisModule_IsIOError`).
+/// Loads return [`std::io::Result`]: the trait models raw IO, so the only
+/// failure at this layer is an IO error. Framing failures
+/// ([`RdbError::MissingTrailingNul`], [`RdbError::InvalidUtf8`]) are raised
+/// one layer up, by the helpers that consume these primitives.
+pub trait RdbIO {
     /// Write a 64-bit unsigned integer.
     fn save_u64(&mut self, v: u64);
     /// Write a 64-bit IEEE-754 double.
@@ -166,15 +182,7 @@ pub trait RdbWrite {
     /// wire format requires is applied by the caller before this is
     /// invoked (see [`save_nul_terminated`]).
     fn save_bytes(&mut self, b: &[u8]);
-}
 
-/// Source for the typed RDB load primitives.
-///
-/// Counterpart to [`RdbWrite`]. Every primitive returns [`std::io::Result`]:
-/// the trait models raw IO, so the only failure at this layer is an IO error.
-/// Framing failures ([`RdbError::MissingTrailingNul`], [`RdbError::InvalidUtf8`])
-/// are raised one layer up, by the helpers that consume these primitives.
-pub trait RdbRead {
     /// Read a 64-bit unsigned integer.
     fn load_u64(&mut self) -> io::Result<u64>;
     /// Read a 64-bit IEEE-754 double.
@@ -207,24 +215,24 @@ pub enum RdbError {
 }
 
 impl From<io::Error> for RdbError {
-    /// Lift an IO failure from the [`RdbRead`] primitives into the framing
+    /// Lift an IO failure from the [`RdbIO`] load primitives into the framing
     /// error type, so `?` threads `io::Result` through the framing helpers.
     fn from(_: io::Error) -> Self {
         RdbError::Io
     }
 }
 
-/// In-memory [`RdbWrite`] / [`RdbRead`] mocks shared by the byte-keyed and
-/// str-keyed RDB test suites. Lives here (rather than inside either test
-/// module) so both [`crate::byte`]'s and [`crate::str`]'s tests
-/// import the same `Op` enum — keeps the wire-shape assertions cross-checkable
-/// against one canonical representation.
+/// In-memory [`RdbIO`] mock shared by the byte-keyed and str-keyed RDB test
+/// suites. Lives here (rather than inside either test module) so both
+/// [`crate::byte`]'s and [`crate::str`]'s tests import the same `Op` enum —
+/// keeps the wire-shape assertions cross-checkable against one canonical
+/// representation.
 #[cfg(test)]
 pub(crate) mod test_helpers {
     use super::*;
 
-    /// One typed call against [`RdbWrite`] / [`RdbRead`]. The wire-shape
-    /// tests assert against `Vec<Op>` traces directly.
+    /// One typed call against [`RdbIO`]. The wire-shape tests assert against
+    /// `Vec<Op>` traces directly.
     #[derive(Debug, Clone, PartialEq)]
     pub(crate) enum Op {
         U64(u64),
@@ -232,80 +240,80 @@ pub(crate) mod test_helpers {
         Bytes(Vec<u8>),
     }
 
-    /// [`RdbWrite`] impl that records every call as an [`Op`]. The trace
-    /// is exposed via the tuple field so tests can both inspect it
-    /// (`rec.0`) and move it into a [`Replayer`].
+    /// Round-trip [`RdbIO`] mock: `save_*` append to `ops`; `load_*` replay
+    /// them in order from an internal read cursor. One buffer, so saving into
+    /// the mock and then loading it back reproduces the production save→load
+    /// path against a single endpoint — the shape the real `RedisModuleIO`
+    /// handle has. `ops` is public so wire-shape tests can assert the exact
+    /// recorded trace.
     #[derive(Default)]
-    pub(crate) struct Recorder(pub(crate) Vec<Op>);
-    impl RdbWrite for Recorder {
-        fn save_u64(&mut self, v: u64) {
-            self.0.push(Op::U64(v));
-        }
-        fn save_f64(&mut self, v: f64) {
-            self.0.push(Op::F64(v));
-        }
-        fn save_bytes(&mut self, b: &[u8]) {
-            self.0.push(Op::Bytes(b.to_vec()));
-        }
-    }
-
-    /// [`RdbRead`] impl that replays a recorded [`Op`] trace. Optionally
-    /// short-circuits with an [`std::io::Error`] after `n` calls to exercise
-    /// mid-stream IO failure paths.
-    pub(crate) struct Replayer {
-        ops: std::vec::IntoIter<Op>,
+    pub(crate) struct RdbMock {
+        pub(crate) ops: Vec<Op>,
+        read_pos: usize,
         fail_after: Option<usize>,
-        calls: usize,
+        read_calls: usize,
     }
 
-    impl Replayer {
-        pub(crate) fn new(ops: Vec<Op>) -> Self {
+    impl RdbMock {
+        /// Preload the mock with a known op stream, for load-only tests that
+        /// feed a hand-built (possibly malformed) trace rather than saving one.
+        pub(crate) fn from_ops(ops: Vec<Op>) -> Self {
             Self {
-                ops: ops.into_iter(),
-                fail_after: None,
-                calls: 0,
+                ops,
+                ..Self::default()
             }
         }
 
-        pub(crate) fn fail_after(ops: Vec<Op>, n: usize) -> Self {
-            Self {
-                ops: ops.into_iter(),
-                fail_after: Some(n),
-                calls: 0,
-            }
+        /// Short-circuit `load_*` with an [`std::io::Error`] after `n`
+        /// successful reads, to exercise mid-stream IO failure paths.
+        pub(crate) fn fail_after(mut self, n: usize) -> Self {
+            self.fail_after = Some(n);
+            self
         }
 
-        fn step(&mut self) -> io::Result<Op> {
+        fn next_read(&mut self) -> io::Result<Op> {
             if let Some(n) = self.fail_after
-                && self.calls >= n
+                && self.read_calls >= n
             {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "mock: injected io failure",
                 ));
             }
-            self.calls += 1;
-            self.ops.next().ok_or_else(|| {
+            self.read_calls += 1;
+            let op = self.ops.get(self.read_pos).cloned().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::UnexpectedEof, "mock: op stream exhausted")
-            })
+            })?;
+            self.read_pos += 1;
+            Ok(op)
         }
     }
 
-    impl RdbRead for Replayer {
+    impl RdbIO for RdbMock {
+        fn save_u64(&mut self, v: u64) {
+            self.ops.push(Op::U64(v));
+        }
+        fn save_f64(&mut self, v: f64) {
+            self.ops.push(Op::F64(v));
+        }
+        fn save_bytes(&mut self, b: &[u8]) {
+            self.ops.push(Op::Bytes(b.to_vec()));
+        }
+
         fn load_u64(&mut self) -> io::Result<u64> {
-            match self.step()? {
+            match self.next_read()? {
                 Op::U64(v) => Ok(v),
                 op => panic!("mock: expected U64, got {op:?}"),
             }
         }
         fn load_f64(&mut self) -> io::Result<f64> {
-            match self.step()? {
+            match self.next_read()? {
                 Op::F64(v) => Ok(v),
                 op => panic!("mock: expected F64, got {op:?}"),
             }
         }
         fn load_bytes(&mut self) -> io::Result<Vec<u8>> {
-            match self.step()? {
+            match self.next_read()? {
                 Op::Bytes(v) => Ok(v),
                 op => panic!("mock: expected Bytes, got {op:?}"),
             }
