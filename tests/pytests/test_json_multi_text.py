@@ -449,7 +449,7 @@ def testconfigMultiTextOffsetDelta(env):
     env.cmd('FT.CREATE', 'idx_category_arr', 'ON', 'JSON', 'SCHEMA', '$.category', 'AS', 'category', 'TEXT')
     waitForIndex(env, 'idx_category_arr')
 
-    env.expect(config_cmd(), 'SET', 'MULTI_TEXT_SLOP', '101').error().contains("Not modifiable at runtime")
+    env.expect(config_cmd(), 'SET', 'MULTI_TEXT_SLOP', '101').error().contains('Not modifiable at runtime')
 
 
     # MULTI_TEXT_SLOP = 100 (Default)

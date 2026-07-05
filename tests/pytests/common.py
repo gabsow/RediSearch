@@ -26,6 +26,7 @@ import inspect
 import math
 import tempfile
 import faker
+import redis.client
 
 TEST_RDBS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test_rdbs')
 REDISEARCH_CACHE_DIR = os.path.join(tempfile.gettempdir(), 'redisearch-rdbs')
@@ -360,6 +361,217 @@ def collectKeys(env, pattern='*'):
         keys.extend(conn.keys(pattern))
     return sorted(keys)
 
+
+# ---------------------------------------------------------------------------
+# Enterprise test-compatibility helpers
+# Gated by RS_TEST_ENTERPRISE=1; default=0 → zero behavior change on OSS CI.
+# ---------------------------------------------------------------------------
+
+# Enterprise standalone test builds expose the local config command as
+# _FT.CONFIG.  Route public FT.CONFIG SET/GET through that command so OSS tests
+# exercise the same FT.CONFIG parser and reply shape instead of emulating it
+# with Redis CONFIG search-* twins.
+
+def _strip_shard_id_from_profile(obj):
+    """Strip 'Shard ID',<value> pair from each shard flat list in FT.PROFILE reply.
+    Enterprise inserts 'Shard ID' before 'Warning', shifting Iterators profile index.
+    Normalizes the shard list to the OSS layout so positional accesses work unchanged.
+    No-op when RS_TEST_ENTERPRISE is off or the key is absent."""
+    if not RS_TEST_ENTERPRISE or CLUSTER or not isinstance(obj, list) or len(obj) < 2:
+        return obj
+    # FT.PROFILE RESP2 structure: [search_result, ['Shards', [shard0, shard1, ...], ...]]
+    # shard is a flat list: ['Shard ID', '1', 'Warning', [...], 'Iterators profile', ...]
+    # Walk recursively through lists; strip ['Shard ID', <val>] from flat k-v lists.
+    def _strip_shard(lst):
+        if not isinstance(lst, list):
+            return lst
+        # Check if this looks like a shard profile flat list containing 'Shard ID'
+        try:
+            idx = lst.index('Shard ID')
+            if idx % 2 == 0 and idx + 1 < len(lst):
+                lst = lst[:idx] + lst[idx+2:]
+        except ValueError:
+            pass
+        return [_strip_shard(v) if isinstance(v, list) else v for v in lst]
+    return _strip_shard(obj)
+
+
+if RS_TEST_ENTERPRISE:
+    _orig_execute_command = redis.client.Redis.execute_command
+
+    def _enterprise_execute_command(self, *args, **kwargs):
+        """Intercept command rewrites for enterprise/OSS compat:
+        - FT.CONFIG GET|SET → _FT.CONFIG GET|SET
+        - _FT._RESTOREIFNX → FT._RESTOREIFNX (enterprise registers without leading underscore)
+        - FT.PROFILE: strip 'Shard ID' from each shard's flat list to normalize positions
+        """
+        # Rewrite _FT._RESTOREIFNX -> FT._RESTOREIFNX
+        if args and str(args[0]).upper() == '_FT._RESTOREIFNX':
+            args = ('FT._RESTOREIFNX',) + tuple(args[1:])
+        if (len(args) >= 2
+                and str(args[0]).upper() == 'FT.CONFIG'
+                and str(args[1]).upper() in ('SET', 'GET')):
+            args = ('_FT.CONFIG',) + tuple(args[1:])
+        # FT.PROFILE: strip Shard ID from raw RESP2 shard lists so index [3] stays = Iterators profile value
+        if args and str(args[0]).upper() == 'FT.PROFILE':
+            raw = _orig_execute_command(self, *args, **kwargs)
+            return _strip_shard_id_from_profile(raw)
+        # SAVE collision: wait for any in-progress BGSAVE before issuing SAVE.
+        # Enterprise background-saves can fire automatically; OSS tests that call
+        # SAVE directly would race and get 'Background save already in progress'.
+        if args and str(args[0]).upper() == 'SAVE':
+            import time as _time
+            for _attempt in range(50):  # up to ~5 s
+                try:
+                    info = _orig_execute_command(self, 'INFO', 'persistence')
+                    # INFO returns a string in RESP2
+                    if isinstance(info, str):
+                        in_progress = 'rdb_bgsave_in_progress:1' in info
+                    elif isinstance(info, dict):
+                        in_progress = bool(info.get('rdb_bgsave_in_progress', 0))
+                    else:
+                        in_progress = False
+                    if not in_progress:
+                        break
+                except Exception:
+                    break
+                _time.sleep(0.1)
+            # Now issue SAVE and retry once if still racing
+            for _attempt in range(3):
+                try:
+                    return _orig_execute_command(self, *args, **kwargs)
+                except Exception as _exc:
+                    if 'Background save already in progress' in str(_exc) and _attempt < 2:
+                        _time.sleep(0.2)
+                        continue
+                    raise
+        return _orig_execute_command(self, *args, **kwargs)
+
+    redis.client.Redis.execute_command = _enterprise_execute_command
+
+# Seed single-shard coordinator topology on standalone Enterprise envs.
+# The enterprise build leaves the search coordinator uninitialized
+# (NumShards==0) until SEARCH.CLUSTERSET arrives, so coordinator-gated
+# commands (FT.SEARCH / FT.AGGREGATE / _FT.DEBUG query-debug) reply
+# "ERRCLUSTER Uninitialized cluster state".  OSS standalone auto-seeds
+# NumShards=1 at module init; the enterprise build defers it.  Mirror
+# flow-tests' configure_search_cluster_single_shard(): seed a single-shard
+# topology (all slots 0-16383) on every standalone env at startup so the
+# local query pipeline runs exactly as it does on OSS standalone.  Real
+# cluster envs set their own topology and are left untouched.
+
+if RS_TEST_ENTERPRISE:
+    _orig_env_init = Env.__init__
+
+    def _enterprise_env_init(self, *args, **kwargs):
+        _orig_env_init(self, *args, **kwargs)
+        # Only single-node (non-cluster) envs need seeding; skip real cluster
+        # envs (they set their own topology) and 'existing' external servers.
+        try:
+            if self.isCluster() or 'existing' in self.env:
+                return
+        except Exception:
+            return
+        conn = self.getConnection()
+        port = conn.connection_pool.connection_kwargs.get('port')
+        try:
+            conn.execute_command(
+                'SEARCH.CLUSTERSET',
+                'MYID', '1',
+                'RANGES', '1',
+                'SHARD', '1',
+                'SLOTRANGE', '0', '16383',
+                'ADDR', f'password@127.0.0.1:{port}',
+                'MASTER',
+            )
+        except redis.exceptions.ResponseError:
+            # Best-effort: some standalone envs load the module without the
+            # coordinator command (SEARCH.CLUSTERSET absent) -> nothing to seed,
+            # and the coordinator NumShards==0 gate isn't active there either.
+            pass
+
+    Env.__init__ = _enterprise_env_init
+
+    # Also re-seed topology after Env.start() (restart loses the topology).
+    _orig_env_start = Env.start
+
+    def _enterprise_env_start(self, *args, **kwargs):
+        _orig_env_start(self, *args, **kwargs)
+        try:
+            if self.isCluster() or 'existing' in self.env:
+                return
+        except Exception:
+            return
+        conn = self.getConnection()
+        port = conn.connection_pool.connection_kwargs.get('port')
+        try:
+            conn.execute_command(
+                'SEARCH.CLUSTERSET',
+                'MYID', '1',
+                'RANGES', '1',
+                'SHARD', '1',
+                'SLOTRANGE', '0', '16383',
+                'ADDR', f'password@127.0.0.1:{port}',
+                'MASTER',
+            )
+        except Exception:
+            pass
+        # Also seed slave if present (useSlaves=True)
+        try:
+            slave_conn = self.getSlaveConnection()
+            slave_port = slave_conn.connection_pool.connection_kwargs.get('port')
+            slave_conn.execute_command(
+                'SEARCH.CLUSTERSET',
+                'MYID', '1',
+                'RANGES', '1',
+                'SHARD', '1',
+                'SLOTRANGE', '0', '16383',
+                'ADDR', f'password@127.0.0.1:{slave_port}',
+                'MASTER',
+            )
+        except Exception:
+            pass
+
+    Env.start = _enterprise_env_start
+    _orig_env_dump_and_reload = Env.dumpAndReload
+    def _enterprise_env_dump_and_reload(self, restart=False, shardId=None, timeout_sec=40):
+        _orig_env_dump_and_reload(self, restart=restart, shardId=shardId, timeout_sec=timeout_sec)
+        if not restart:
+            return
+        # After restart, re-seed single-shard coordinator topology (same as _enterprise_env_start)
+        try:
+            if self.isCluster() or 'existing' in self.env:
+                return
+        except Exception:
+            return
+        conn = self.getConnection()
+        port = conn.connection_pool.connection_kwargs.get('port')
+        try:
+            conn.execute_command(
+                'SEARCH.CLUSTERSET', 'MYID', '1', 'RANGES', '1',
+                'SHARD', '1', 'SLOTRANGE', '0', '16383',
+                'ADDR', f'password@127.0.0.1:{port}', 'MASTER',
+            )
+        except Exception:
+            pass
+    Env.dumpAndReload = _enterprise_env_dump_and_reload
+
+# Strip the enterprise-only 'Shard ID' key from standalone FT.PROFILE replies.
+
+def strip_enterprise_profile_keys(obj):
+    """Recursively remove the enterprise-only 'Shard ID' key from an
+    FT.PROFILE reply so community-shaped expected values still match.
+    No-op unless RS_TEST_ENTERPRISE=1."""
+    if not RS_TEST_ENTERPRISE or CLUSTER:
+        return obj
+    if isinstance(obj, dict):
+        return {k: strip_enterprise_profile_keys(v)
+                for k, v in obj.items() if k != 'Shard ID'}
+    if isinstance(obj, list):
+        return [strip_enterprise_profile_keys(v) for v in obj]
+    return obj
+
+# ---------------------------------------------------------------------------
 
 def debug_cmd():
     return '_FT.DEBUG'
