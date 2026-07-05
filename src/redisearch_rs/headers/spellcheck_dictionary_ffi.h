@@ -8,6 +8,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/**
+ * A case-preserving set of spell-check terms.
+ *
+ * See the [crate-level case model](crate#case-model) for how case is handled
+ * across queries and removal.
+ */
 typedef struct SpellCheckDictionary SpellCheckDictionary;
 
 /**
