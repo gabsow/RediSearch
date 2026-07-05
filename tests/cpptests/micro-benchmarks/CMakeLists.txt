@@ -43,3 +43,7 @@ endforeach()
 # Standalone micro-benchmarks (no iterator/index_utils dependency).
 add_executable(benchmark_unicode_tolower benchmark_unicode_tolower.cpp)
 target_link_libraries(benchmark_unicode_tolower redisearch redismock benchmark::benchmark)
+
+# Local-only (bench_*) A/B: C spell-check dictionary trie vs Rust SpellCheckDictionary.
+add_executable(bench_spellcheck bench_spellcheck.cpp)
+target_link_libraries(bench_spellcheck redisearch redismock benchmark::benchmark)
