@@ -372,6 +372,11 @@ after_includes = """
 typedef struct timespec timespec;
 """
 
+[header.spellcheck_dictionary_ffi]
+# `RedisModuleIO` (from the skipped `ffi` package) appears in the RDB
+# save/load signatures; pull in its definition.
+includes = ["redismodule.h"]
+
 [header.trie_rdb_ffi]
 # `RedisModuleIO` (from the skipped `ffi` package) appears in the RDB
 # save/load signatures; pull in its definition.

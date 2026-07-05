@@ -22,9 +22,11 @@
 
 mod dictionary;
 mod iter_cursor;
+mod rdb;
 
 pub use dictionary::*;
 pub use iter_cursor::*;
+pub use rdb::*;
 
 /// A set of spell-check dictionary terms supporting case-insensitive exact
 /// and fuzzy (Levenshtein edit distance) lookups.

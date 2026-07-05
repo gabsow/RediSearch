@@ -2745,6 +2745,7 @@ dependencies = [
  "rstest",
  "string_utils",
  "strsim",
+ "trie_rdb",
  "trie_rs",
  "workspace_hack",
 ]
@@ -2753,7 +2754,9 @@ dependencies = [
 name = "spellcheck_dictionary_ffi"
 version = "0.0.1"
 dependencies = [
+ "ffi",
  "spellcheck_dictionary",
+ "trie_rdb_ffi",
  "workspace_hack",
 ]
 

@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include "redismodule.h"
 
 /**
  * A case-preserving set of spell-check terms.
@@ -71,6 +72,28 @@ void SpellCheckDictionary_Free(struct SpellCheckDictionary *dict);
 struct SpellCheckDictionaryIterator *SpellCheckDictionary_IterateAll(const struct SpellCheckDictionary *dict);
 
 /**
+ * Serialize a [`SpellCheckDictionary`] to `io`.
+ *
+ * Emits the same stream the C aux save callback writes per dict
+ * (`TrieType_GenericSave` without payloads or `num_docs`). Save is
+ * infallible at this layer; any underlying RDB IO error surfaces later via
+ * `RedisModule_IsIOError` on the load side.
+ *
+ * # Safety
+ *
+ * 1. `io` must be a [valid], non-null `*mut RedisModuleIO` supplied by the
+ *    calling Redis module save callback, and remain valid for the duration
+ *    of the call.
+ * 2. `dict` must be a [valid], non-null pointer obtained from
+ *    [`SpellCheckDictionary_New`] or [`SpellCheckDictionary_RdbLoad`]. No
+ *    mutating call on `dict` may run concurrently with this call.
+ *
+ * [valid]: https://doc.rust-lang.org/std/ptr/index.html#safety
+ * [`SpellCheckDictionary_New`]: super::SpellCheckDictionary_New
+ */
+void SpellCheckDictionary_RdbSave(RedisModuleIO *io, const struct SpellCheckDictionary *dict);
+
+/**
  * Add `term` (`len` UTF-8 bytes) to the dictionary, stored verbatim
  * (case-preserving). Empty or over-long terms are rejected.
  *
@@ -91,6 +114,26 @@ struct SpellCheckDictionaryIterator *SpellCheckDictionary_IterateAll(const struc
  * [valid]: https://doc.rust-lang.org/std/ptr/index.html#safety
  */
 bool SpellCheckDictionary_Add(struct SpellCheckDictionary *dict, const char *term, size_t len);
+
+/**
+ * Deserialize a [`SpellCheckDictionary`] from `io`, accepting the stream
+ * the C aux save callback writes per dict. Returns NULL on any RDB IO or
+ * framing error (including non-UTF-8 keys), matching the C contract of
+ * `TrieType_GenericLoad`.
+ *
+ * On success, the caller owns the returned pointer and must release it via
+ * [`SpellCheckDictionary_Free`].
+ *
+ * # Safety
+ *
+ * 1. `io` must be a [valid], non-null `*mut RedisModuleIO` supplied by the
+ *    calling Redis module load callback, and remain valid for the duration
+ *    of the call.
+ *
+ * [valid]: https://doc.rust-lang.org/std/ptr/index.html#safety
+ * [`SpellCheckDictionary_Free`]: super::SpellCheckDictionary_Free
+ */
+struct SpellCheckDictionary *SpellCheckDictionary_RdbLoad(RedisModuleIO *io);
 
 /**
  * Iterate over the stored terms within Levenshtein edit distance

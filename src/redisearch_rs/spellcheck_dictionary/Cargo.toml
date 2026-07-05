@@ -12,6 +12,7 @@ workspace = true
 ffi.workspace = true
 strsim.workspace = true
 string_utils.workspace = true
+trie_rdb.workspace = true
 trie_rs.workspace = true
 workspace_hack.workspace = true
 
