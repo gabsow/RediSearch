@@ -440,14 +440,22 @@ impl<E: Encoder> InvertedIndex<E> {
         // with worse locality (and more per-snapshot refcount work) than master's single
         // contiguous vector. Only checked on a rollover (when `pending` actually grew).
         //
-        // PROTOTYPE NOTE: the fold's memory delta (N `Arc<IndexBlock>` allocations + the
-        // `pending` Vec heap collapsing into one `Arc<[IndexBlock]>`) is NOT yet reconciled
-        // into `mem_growth`, so `spec->stats.invertedSize` will drift. Productization must
-        // thread the delta out (AddRecordOutcome only carries a u32 growth today).
+        // The fold reallocates `sealed` and moves M+N block structs, so it must stay on a
+        // geometric schedule (amortized O(n)) regardless of snapshots. But the per-block
+        // *COW clone* only fires when a live snapshot pins the region; with no snapshot
+        // (`strong_count == 1`) the fold is all cheap moves, so we fold more eagerly — at ¼
+        // of `sealed` rather than 1× — to keep `pending` small (better read locality)
+        // without paying the copy cost. Still geometric (~1.25× growth), so still O(n).
         let mut mem_freed: usize = 0;
+        let unpinned = Arc::strong_count(&self.sealed) == 1;
+        let ratio_reached = if unpinned {
+            self.pending.len() >= self.sealed.len() >> 2
+        } else {
+            self.pending.len() >= self.sealed.len()
+        };
         if rollovers_into_pending > 0
             && self.pending.len() >= FOLD_MIN_PENDING_BLOCKS
-            && self.pending.len() >= self.sealed.len()
+            && ratio_reached
         {
             mem_freed = self.fold_pending_into_sealed();
         }
@@ -485,8 +493,7 @@ impl<E: Encoder> InvertedIndex<E> {
         let new_len = self.sealed.len() + self.pending.len();
         let mut new_sealed: Arc<[MaybeUninit<IndexBlock>]> = Arc::new_uninit_slice(new_len);
         // Uniquely owned right after allocation — `get_mut` is `Some`.
-        let slots =
-            Arc::get_mut(&mut new_sealed).expect("freshly allocated Arc is uniquely owned");
+        let slots = Arc::get_mut(&mut new_sealed).expect("freshly allocated Arc is uniquely owned");
         let mut write_idx = 0usize;
 
         // `sealed`: move each block out via a placeholder swap when unpinned; deep-copy
