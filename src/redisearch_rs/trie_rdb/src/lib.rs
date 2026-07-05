@@ -10,21 +10,25 @@
 //! RDB serialization for the [`trie_rs`] trie maps.
 //!
 //! Mirrors the wire format produced by the C functions `TrieType_GenericSave`
-//! and `TrieType_GenericLoad`. IO primitives come from the shared [`RdbIO`]
-//! trait (defined in the `rdb_io` crate, re-exported here); this crate owns
-//! the trie-specific substrate on top of it — [`RdbOpts`], [`RdbError`], the
-//! NUL-framing helpers, and the [`load_with`] entry-stream reader — plus the
-//! [`TrieEntry`] value type it serializes. The two concrete serializers live
-//! alongside it:
+//! and `TrieType_GenericLoad`. This crate owns the shared substrate —
+//! the [`RdbWrite`] / [`RdbRead`] IO traits, [`RdbOpts`], [`RdbError`], the
+//! NUL-framing helpers, and the [`read_entries`] entry-stream reader — plus
+//! the [`TrieEntry`] value type the wire fields are modeled on. The two
+//! serializer flavors live alongside it:
 //!
-//! - [`byte`] — for the byte-keyed [`trie_rs::TrieMap`]`<TrieEntry>`.
-//! - [`mod@str`] — for the UTF-8-keyed [`trie_rs::str_trie_map::StrTrieMap`]`<TrieEntry>`,
+//! - [`byte`] — for the byte-keyed [`trie_rs::TrieMap`].
+//! - [`mod@str`] — for the UTF-8-keyed [`trie_rs::str_trie_map::StrTrieMap`],
 //!   a thin wrapper that delegates to [`byte`] and is byte-identical on the wire.
 //!
-//! IO is abstracted behind the [`RdbIO`] trait, so the algorithm is generic
-//! over the endpoint: the C entrypoint (in the `trie_rdb_ffi` crate) drives it
-//! over `RedisModuleIO` via the `rdb_io` impl, and pure-Rust callers can drive
-//! it over any buffer.
+//! Each flavor is generic over the map's payload type (`save_with` /
+//! `load_with`, with a per-entry mapping to and from the wire fields) and
+//! offers `save` / `load` shorthands for maps that store [`TrieEntry`]
+//! itself.
+//!
+//! IO is abstracted behind the [`RdbWrite`] / [`RdbRead`] traits so this crate
+//! carries no Redis dependency: the C entrypoints implement them over
+//! `RedisModuleIO` (in the `trie_rdb_ffi` crate), and pure-Rust callers can
+//! implement them over any buffer.
 //!
 //! # Wire format
 //!
@@ -71,8 +75,7 @@ pub mod str;
 
 use std::io;
 
-pub use entry::TrieEntry;
-pub use rdb_io::RdbIO;
+pub use entry::{EntryFields, TrieEntry};
 
 /// Read the entry stream shared by both key flavors and feed each decoded
 /// entry to `insert`.
@@ -83,8 +86,8 @@ pub use rdb_io::RdbIO;
 /// raw key bytes become a key: `key_from_bytes` maps the NUL-stripped buffer
 /// into the caller's key type (identity for bytes, UTF-8 validation for str),
 /// and `insert` places the finished `(key, entry)` into the caller's map.
-pub(crate) fn load_with<IO, K>(
-    reader: &mut IO,
+pub(crate) fn read_entries<R, K>(
+    reader: &mut R,
     opts: RdbOpts,
     mut key_from_bytes: impl FnMut(Vec<u8>) -> Result<K, RdbError>,
     mut insert: impl FnMut(K, TrieEntry),

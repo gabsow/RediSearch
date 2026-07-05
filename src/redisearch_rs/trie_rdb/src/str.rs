@@ -7,7 +7,7 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 
-//! RDB serialization for [`StrTrieMap<TrieEntry>`].
+//! RDB serialization for [`StrTrieMap`].
 //!
 //! Wraps the byte-keyed [`crate::byte`] surface for callers whose keys
 //! are UTF-8 by type. The wire format is byte-identical to the byte-keyed
@@ -17,35 +17,62 @@
 //! [`RdbError::InvalidUtf8`] rather than silently materializing as an
 //! ill-formed `String`.
 
-use super::{RdbError, RdbIO, RdbOpts, byte, load_with};
-use crate::TrieEntry;
+use super::{RdbError, RdbOpts, RdbRead, RdbWrite, byte, read_entries};
+use crate::{EntryFields, TrieEntry};
 use trie_rs::str_trie_map::StrTrieMap;
+
+/// Serialize a [`StrTrieMap`] with an arbitrary payload type to `writer`
+/// in the trie RDB wire format.
+///
+/// `fields` produces the wire fields for each entry's payload, as in
+/// [`crate::byte::save_with`]. Delegates to it on the inner byte-keyed
+/// [`trie_rs::TrieMap`]; the wire output is byte-identical.
+pub fn save_with<P, W: RdbWrite>(
+    map: &StrTrieMap<P>,
+    writer: &mut W,
+    opts: RdbOpts,
+    fields: impl for<'a> FnMut(&'a P) -> EntryFields<'a>,
+) {
+    byte::save_with(map.byte_trie(), writer, opts, fields);
+}
 
 /// Serialize a [`StrTrieMap<TrieEntry>`] to `writer` in the trie RDB wire
 /// format.
 ///
-/// Delegates to [`crate::byte::save`] on the inner byte-keyed
-/// [`trie_rs::TrieMap`]; the wire output is byte-identical.
-pub fn save<IO: RdbIO>(map: &StrTrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
-    byte::save(map.byte_trie(), io, opts);
+/// Shorthand for [`save_with`] with the identity field mapping.
+pub fn save<W: RdbWrite>(map: &StrTrieMap<TrieEntry>, writer: &mut W, opts: RdbOpts) {
+    byte::save(map.byte_trie(), writer, opts);
+}
+
+/// Deserialize a [`StrTrieMap`] with an arbitrary payload type from
+/// `reader`.
+///
+/// `opts` must match the [`RdbOpts`] used at save time. `payload` builds
+/// each stored payload from the decoded wire fields, as in
+/// [`crate::byte::load_with`]. Each loaded key buffer is UTF-8 validated;
+/// on failure the load aborts with [`RdbError::InvalidUtf8`].
+pub fn load_with<P, R: RdbRead>(
+    reader: &mut R,
+    opts: RdbOpts,
+    mut payload: impl FnMut(TrieEntry) -> P,
+) -> Result<StrTrieMap<P>, RdbError> {
+    let mut map = StrTrieMap::new();
+    read_entries(
+        reader,
+        opts,
+        |bytes| String::from_utf8(bytes).map_err(|_| RdbError::InvalidUtf8),
+        |key, entry| {
+            map.insert(&key, payload(entry));
+        },
+    )?;
+    Ok(map)
 }
 
 /// Deserialize a [`StrTrieMap<TrieEntry>`] from `reader`.
 ///
-/// `opts` must match the [`RdbOpts`] used at save time. Each loaded key
-/// buffer is UTF-8 validated; on failure the load aborts with
-/// [`RdbError::InvalidUtf8`].
-pub fn load<IO: RdbIO>(io: &mut IO, opts: RdbOpts) -> Result<StrTrieMap<TrieEntry>, RdbError> {
-    let mut map = StrTrieMap::new();
-    load_with(
-        io,
-        opts,
-        |bytes| String::from_utf8(bytes).map_err(|_| RdbError::InvalidUtf8),
-        |key, entry| {
-            map.insert(&key, entry);
-        },
-    )?;
-    Ok(map)
+/// Shorthand for [`load_with`] with the identity payload mapping.
+pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<StrTrieMap<TrieEntry>, RdbError> {
+    load_with(reader, opts, |entry| entry)
 }
 
 #[cfg(test)]
@@ -90,6 +117,26 @@ mod tests {
             Err(other) => panic!("expected InvalidUtf8, got {other:?}"),
             Ok(_) => panic!("expected InvalidUtf8 error, got Ok"),
         }
+    }
+
+    #[test]
+    fn unit_payload_roundtrip_str_keys() {
+        let mut map = StrTrieMap::new();
+        map.insert("héllo", ());
+        map.insert("world", ());
+        let mut rec = Recorder::default();
+        save_with(&map, &mut rec, RdbOpts::default(), |()| EntryFields {
+            score: 1.0,
+            payload: None,
+            num_docs: 0,
+        });
+
+        let loaded = load_with(&mut Replayer::new(rec.0), RdbOpts::default(), |_| ())
+            .expect("load should succeed");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.get("héllo"), Some(&()));
+        assert_eq!(loaded.get("world"), Some(&()));
     }
 
     #[test]

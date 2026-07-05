@@ -18,6 +18,26 @@
 /// `payload: None` and `payload: Some(vec![])` are wire-indistinguishable
 /// when payloads are persisted — both round-trip as `None`. See
 /// [`crate::RdbOpts::payloads`].
+/// Borrowed view of the wire fields of one entry, handed to the generic
+/// save path.
+///
+/// The payload-generic serializers ([`crate::byte::save_with`],
+/// [`crate::str::save_with`]) ask the caller to produce one of these per
+/// entry, so any payload type can be persisted without first materializing
+/// a [`TrieEntry`] (and cloning its payload bytes). Which of these fields
+/// actually reach the wire is governed by [`crate::RdbOpts`], same as for
+/// [`TrieEntry`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EntryFields<'a> {
+    /// See [`TrieEntry::score`].
+    pub score: f64,
+    /// See [`TrieEntry::payload`]. `None` and `Some(&[])` are
+    /// wire-indistinguishable, like the owned form.
+    pub payload: Option<&'a [u8]>,
+    /// See [`TrieEntry::num_docs`].
+    pub num_docs: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrieEntry {
     /// Score associated with the entry. Semantics are caller-defined (e.g.

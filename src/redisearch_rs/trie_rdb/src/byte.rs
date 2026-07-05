@@ -7,31 +7,43 @@
  * GNU Affero General Public License v3 (AGPLv3).
 */
 
-//! RDB serialization for the byte-keyed [`TrieMap<TrieEntry>`].
+//! RDB serialization for the byte-keyed [`TrieMap`].
 //!
 //! This is the canonical serializer; the UTF-8-keyed [`crate::str`]
 //! wrapper delegates to it. The wire format and framing rules are documented
 //! on the crate root.
 
 use super::{RdbError, RdbIO, RdbOpts, load_with, save_nul_terminated};
-use crate::TrieEntry;
+use crate::{EntryFields, TrieEntry};
 use trie_rs::TrieMap;
 
-/// Serialize a [`TrieMap<TrieEntry>`] to `writer` in the trie RDB wire format.
+/// Serialize a [`TrieMap`] with an arbitrary payload type to `writer` in
+/// the trie RDB wire format.
+///
+/// `fields` produces the wire fields ([`EntryFields`]) for each entry's
+/// payload; which of them actually reach the wire is governed by `opts`.
+/// Payload types that carry no wire data map to constants (e.g. a `()`
+/// payload saving as score 1).
 ///
 /// Iterates entries in lexicographic key order. Keys, and payloads when
 /// [`RdbOpts::payloads`] is set, are written with a trailing NUL byte to
 /// match the C wire format (the loader strips it back off). One scratch
 /// buffer is reused across all entries so the per-key NUL padding costs
 /// at most one allocation per save call.
-pub fn save<IO: RdbIO>(map: &TrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
+pub fn save_with<P, IO: RdbIO>(
+    map: &TrieMap<P>,
+    io: &mut IO,
+    opts: RdbOpts,
+    mut fields: impl for<'a> FnMut(&'a P) -> EntryFields<'a>,
+) {
     io.write_u64(map.n_unique_keys() as u64);
     let mut scratch = Vec::new();
-    for (key, entry) in map.iter() {
+    for (key, payload) in map.iter() {
+        let entry = fields(payload);
         save_nul_terminated(io, &mut scratch, &key);
         io.write_f64(entry.score);
         if opts.payloads {
-            save_nul_terminated(io, &mut scratch, entry.payload.as_deref().unwrap_or(&[]));
+            save_nul_terminated(io, &mut scratch, entry.payload.unwrap_or(&[]));
         }
         if opts.num_docs {
             io.write_u64(entry.num_docs);
@@ -39,19 +51,44 @@ pub fn save<IO: RdbIO>(map: &TrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
     }
 }
 
-/// Deserialize a [`TrieMap<TrieEntry>`] from `reader`.
+/// Serialize a [`TrieMap<TrieEntry>`] to `writer` in the trie RDB wire
+/// format.
 ///
-/// `opts` must match the [`RdbOpts`] used at save time.
+/// Shorthand for [`save_with`] with the identity field mapping.
+pub fn save<W: RdbWrite>(map: &TrieMap<TrieEntry>, writer: &mut W, opts: RdbOpts) {
+    save_with(map, writer, opts, |entry| EntryFields {
+        score: entry.score,
+        payload: entry.payload.as_deref(),
+        num_docs: entry.num_docs,
+    });
+}
+
+/// Deserialize a [`TrieMap`] with an arbitrary payload type from `reader`.
+///
+/// `opts` must match the [`RdbOpts`] used at save time. `payload` builds
+/// each stored payload from the decoded wire fields; payload types that
+/// carry no wire data simply discard them (e.g. `|_| ()`).
 ///
 /// The trailing NUL byte is stripped from every key (and every payload
 /// when [`RdbOpts::payloads`] is set). An empty payload (i.e. a single-NUL
 /// buffer, `"\0"`) is normalized to `payload: None`.
-pub fn load<IO: RdbIO>(io: &mut IO, opts: RdbOpts) -> Result<TrieMap<TrieEntry>, RdbError> {
+pub fn load_with<P, IO: RdbIO>(
+    io: &mut IO,
+    opts: RdbOpts,
+    mut payload: impl FnMut(TrieEntry) -> P,
+) -> Result<TrieMap<P>, RdbError> {
     let mut map = TrieMap::new();
     load_with(io, opts, Ok, |key, entry| {
-        map.insert(&key, entry);
+        map.insert(&key, payload(entry));
     })?;
     Ok(map)
+}
+
+/// Deserialize a [`TrieMap<TrieEntry>`] from `reader`.
+///
+/// Shorthand for [`load_with`] with the identity payload mapping.
+pub fn load<R: RdbRead>(reader: &mut R, opts: RdbOpts) -> Result<TrieMap<TrieEntry>, RdbError> {
+    load_with(reader, opts, |entry| entry)
 }
 
 #[cfg(test)]
@@ -279,6 +316,49 @@ mod tests {
         let loaded = round_trip(&map, RdbOpts::default());
         assert_eq!(loaded.find(k1), Some(&entry(1.0, None, 0)));
         assert_eq!(loaded.find(k2), Some(&entry(2.0, None, 0)));
+    }
+
+    #[test]
+    fn unit_payload_save_matches_trie_entry_wire() {
+        // A `()` payload mapped to constant fields must be wire-identical to
+        // a `TrieEntry` map holding the same constants.
+        let mut unit_map = TrieMap::new();
+        unit_map.insert(b"a", ());
+        unit_map.insert(b"b", ());
+        let mut entry_map = TrieMap::new();
+        entry_map.insert(b"a", entry(1.0, None, 0));
+        entry_map.insert(b"b", entry(1.0, None, 0));
+
+        let mut rec_unit = Recorder::default();
+        let mut rec_entry = Recorder::default();
+        save_with(&unit_map, &mut rec_unit, RdbOpts::default(), |()| {
+            EntryFields {
+                score: 1.0,
+                payload: None,
+                num_docs: 0,
+            }
+        });
+        save(&entry_map, &mut rec_entry, RdbOpts::default());
+
+        assert_eq!(rec_unit.0, rec_entry.0);
+    }
+
+    #[test]
+    fn unit_payload_roundtrip_discards_wire_fields() {
+        let mut map = TrieMap::new();
+        map.insert(b"k", ());
+        let mut rec = Recorder::default();
+        save_with(&map, &mut rec, RdbOpts::default(), |()| EntryFields {
+            score: 1.0,
+            payload: None,
+            num_docs: 0,
+        });
+
+        let loaded = load_with(&mut Replayer::new(rec.0), RdbOpts::default(), |_| ())
+            .expect("load should succeed");
+
+        assert_eq!(loaded.n_unique_keys(), 1);
+        assert_eq!(loaded.find(b"k"), Some(&()));
     }
 
     #[test]

@@ -35,6 +35,96 @@ use trie_rs::str_trie_map::StrTrieMap;
 /// [`LexTrieRs_New`] or [`LexTrieRs_RdbLoad`]; free via [`LexTrieRs_Free`].
 pub struct LexTrieRs(pub StrTrieMap<TrieEntry>);
 
+/// [`RdbWrite`] backed by a [`RmIo`] wrapping the caller's `RedisModuleIO*`.
+///
+/// The wrapper holds the raw pointer captured at construction and never
+/// stores it anywhere else. Validity is promised at construction (see
+/// [`RmIoWriter::new`]). NUL framing and the scratch buffer that amortizes
+/// its allocation are owned by [`trie_rdb::byte::save`]; this impl just
+/// forwards each slice straight to `RedisModule_SaveStringBuffer` via
+/// [`RmIo::write_slice`].
+///
+/// Public so other `*_ffi` crates whose types persist through [`trie_rdb`]
+/// (e.g. the spell-check dictionary) can drive their save entry points
+/// through the same transport.
+pub struct RmIoWriter {
+    io: RmIo,
+}
+
+impl RmIoWriter {
+    /// Wrap the caller's `RedisModuleIO*` as an [`RdbWrite`] sink.
+    ///
+    /// # Safety
+    ///
+    /// - `io` must be a valid, non-null `*mut RedisModuleIO` supplied by a
+    ///   Redis module save callback, and must remain valid for the entire
+    ///   lifetime of the returned writer — every [`RdbWrite`] method
+    ///   dereferences it.
+    pub unsafe fn new(io: *mut RedisModuleIO) -> Self {
+        Self {
+            io: RmIo::new(io.cast::<raw::RedisModuleIO>()),
+        }
+    }
+}
+
+impl RdbWrite for RmIoWriter {
+    fn save_u64(&mut self, v: u64) {
+        self.io.write_unsigned(v);
+    }
+
+    fn save_f64(&mut self, v: f64) {
+        self.io.write_double(v);
+    }
+
+    fn save_bytes(&mut self, b: &[u8]) {
+        self.io.write_slice(b);
+    }
+}
+
+/// [`RdbRead`] backed by a [`RmIo`] wrapping the caller's `RedisModuleIO*`.
+///
+/// The wrapped `read_*` methods already poll `RedisModule_IsIOError` after
+/// each underlying `RedisModule_Load*` and surface failures as `Err`, so we
+/// do not need a separate `IsIOError` check.
+///
+/// Public for the same cross-crate reuse as [`RmIoWriter`].
+pub struct RmIoReader {
+    io: RmIo,
+}
+
+impl RmIoReader {
+    /// Wrap the caller's `RedisModuleIO*` as an [`RdbRead`] source.
+    ///
+    /// # Safety
+    ///
+    /// - `io` must be a valid, non-null `*mut RedisModuleIO` supplied by a
+    ///   Redis module load callback, and must remain valid for the entire
+    ///   lifetime of the returned reader — every [`RdbRead`] method
+    ///   dereferences it.
+    pub unsafe fn new(io: *mut RedisModuleIO) -> Self {
+        Self {
+            io: RmIo::new(io.cast::<raw::RedisModuleIO>()),
+        }
+    }
+}
+
+impl RdbRead for RmIoReader {
+    fn load_u64(&mut self) -> io::Result<u64> {
+        self.io.read_unsigned().map_err(io::Error::other)
+    }
+
+    fn load_f64(&mut self) -> io::Result<f64> {
+        self.io.read_double().map_err(io::Error::other)
+    }
+
+    fn load_bytes(&mut self) -> io::Result<Vec<u8>> {
+        self.io
+            .read_string_buffer()
+            .map(|buf| buf.as_ref().to_vec())
+            .map_err(io::Error::other)
+    }
+}
+
 /// Allocate an empty [`LexTrieRs`] on the Rust heap.
 ///
 /// The returned pointer owns its allocation and must be released through
@@ -89,7 +179,9 @@ pub unsafe extern "C" fn LexTrieRs_RdbSave(
     // SAFETY: caller guarantees `map` is a valid `*const LexTrieRs`
     // and that no aliasing mutable references exist for the call.
     let map = unsafe { &*map };
-    let mut rm_io = RmIo::new(io.cast::<raw::RedisModuleIO>());
+    // SAFETY: caller guarantees `io` is valid for the duration of the call,
+    // which bounds the writer's lifetime.
+    let mut w = unsafe { RmIoWriter::new(io) };
     let opts = RdbOpts {
         payloads: save_payloads,
         num_docs: save_num_docs,
@@ -119,7 +211,9 @@ pub unsafe extern "C" fn LexTrieRs_RdbLoad(
 ) -> *mut LexTrieRs {
     debug_assert!(!io.is_null(), "io cannot be NULL");
 
-    let mut rm_io = RmIo::new(io.cast::<raw::RedisModuleIO>());
+    // SAFETY: caller guarantees `io` is valid for the duration of the call,
+    // which bounds the reader's lifetime.
+    let mut r = unsafe { RmIoReader::new(io) };
     let opts = RdbOpts {
         payloads: load_payloads,
         num_docs: load_num_docs,
