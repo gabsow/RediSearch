@@ -32,7 +32,6 @@
 #include "trie/levenshtein.h"
 #include "trie/rune_util.h"
 #include "spellcheck_dictionary_ffi.h"
-#include "trie_rdb_ffi.h"
 
 #include <malloc/malloc.h>
 
@@ -372,16 +371,15 @@ void BM_SpellCheck_DumpAll_Rust(benchmark::State& state) {
   SpellCheckDictionary_Free(d);
 }
 
-// ===================== RDB save / load (PROXY rows) =====================
-// PROXY: SpellCheckDictionary has no RDB FFI yet, so the Rust side is
-// `LexTrieRs` (`StrTrieMap<TrieEntry>`), fed the exact dict shape (score 1,
-// no payloads, no numDocs) through the same wire format the C aux callbacks
-// use (`TrieType_GenericSave/Load(…, false, false)`). Wire-format cost and
-// byte-trie rebuild cost are representative; the final SCD structure isn't.
+// ===================== RDB save / load =====================
+// The dict wire format (`TrieType_GenericSave/Load(…, false, false)`, score
+// constant 1) driven through both aux-callback implementations:
+// `TrieType_Generic*` on the C side, `SpellCheckDictionary_Rdb*` on the Rust
+// side. The two emit byte-identical streams, so the load rows parse one
+// C-emitted buffer and the A/B input is identical.
 //
 // Save: BGSAVE / replica-sync serialize, runs in the fork child.
 // Load: server restart / replica full-sync rebuild — the critical path.
-// Both sides parse one C-emitted buffer, so the A/B input is byte-identical.
 
 void BM_SpellCheck_RdbSave_C(benchmark::State& state) {
   auto corpus = MakeCorpus(42, state.range(0));
@@ -400,30 +398,21 @@ void BM_SpellCheck_RdbSave_C(benchmark::State& state) {
   TrieType_Free(t);
 }
 
-void BM_SpellCheck_RdbSave_RustProxy(benchmark::State& state) {
+void BM_SpellCheck_RdbSave_Rust(benchmark::State& state) {
   auto corpus = MakeCorpus(42, state.range(0));
-
-  // Populate the LexTrieRs by parsing a C-emitted buffer (its FFI exposes no
-  // insert; production fills it the same way, via RdbLoad).
-  Trie* t = BuildC(corpus);
-  RedisModuleIO* seed = RMCK_CreateRdbIO();
-  TrieType_GenericSave(seed, t, false, false);
-  TrieType_Free(t);
-  seed->read_pos = 0;
-  LexTrieRs* map = LexTrieRs_RdbLoad(seed, /*load_payloads=*/false, /*load_num_docs=*/false);
-  RMCK_FreeRdbIO(seed);
-
+  SpellCheckDictionary* d = BuildRust(corpus);
   RedisModuleIO* io = RMCK_CreateRdbIO();
+
   for (auto _ : state) {
     io->buffer.clear();  // keeps capacity: steady-state serialize, no regrowth
-    LexTrieRs_RdbSave(io, map, /*save_payloads=*/false, /*save_num_docs=*/false);
+    SpellCheckDictionary_RdbSave(io, d);
     benchmark::DoNotOptimize(io->buffer.data());
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * corpus.size());
   state.counters["rdb_KiB"] = static_cast<double>(io->buffer.size()) / 1024.0;
 
   RMCK_FreeRdbIO(io);
-  LexTrieRs_Free(map);
+  SpellCheckDictionary_Free(d);
 }
 
 void BM_SpellCheck_RdbLoad_C(benchmark::State& state) {
@@ -448,7 +437,7 @@ void BM_SpellCheck_RdbLoad_C(benchmark::State& state) {
   RMCK_FreeRdbIO(io);
 }
 
-void BM_SpellCheck_RdbLoad_RustProxy(benchmark::State& state) {
+void BM_SpellCheck_RdbLoad_Rust(benchmark::State& state) {
   auto corpus = MakeCorpus(42, state.range(0));
   Trie* t = BuildC(corpus);
   RedisModuleIO* io = RMCK_CreateRdbIO();
@@ -457,10 +446,10 @@ void BM_SpellCheck_RdbLoad_RustProxy(benchmark::State& state) {
 
   for (auto _ : state) {
     io->read_pos = 0;
-    LexTrieRs* loaded = LexTrieRs_RdbLoad(io, /*load_payloads=*/false, /*load_num_docs=*/false);
+    SpellCheckDictionary* loaded = SpellCheckDictionary_RdbLoad(io);
     benchmark::DoNotOptimize(loaded);
     state.PauseTiming();
-    LexTrieRs_Free(loaded);
+    SpellCheckDictionary_Free(loaded);
     state.ResumeTiming();
   }
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) * corpus.size());
@@ -491,9 +480,9 @@ BENCHMARK(BM_SpellCheck_Delete_Rust)->Arg(1000)->Arg(10000)->Unit(benchmark::kMi
 BENCHMARK(BM_SpellCheck_DumpAll_C)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_SpellCheck_DumpAll_Rust)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_SpellCheck_RdbSave_C)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
-BENCHMARK(BM_SpellCheck_RdbSave_RustProxy)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SpellCheck_RdbSave_Rust)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
 BENCHMARK(BM_SpellCheck_RdbLoad_C)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
-BENCHMARK(BM_SpellCheck_RdbLoad_RustProxy)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
+BENCHMARK(BM_SpellCheck_RdbLoad_Rust)->Arg(1000)->Arg(10000)->Unit(benchmark::kMicrosecond);
 
 // Minimal module bootstrap: populate the redismock `RedisModule_*` table so
 // the C trie's allocator calls resolve. The Rust side routes through its own
