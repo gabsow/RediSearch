@@ -12,6 +12,7 @@ bench = false
 workspace = true
 
 [dependencies]
+rdb_io.workspace = true
 thiserror.workspace = true
 trie_rs.workspace = true
 workspace_hack.workspace = true

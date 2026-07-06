@@ -10,8 +10,9 @@
 //! RDB serialization for the [`trie_rs`] trie maps.
 //!
 //! Mirrors the wire format produced by the C functions `TrieType_GenericSave`
-//! and `TrieType_GenericLoad`. This crate owns the shared substrate —
-//! the [`RdbIO`] IO trait, [`RdbOpts`], [`RdbError`], the
+//! and `TrieType_GenericLoad`. IO primitives come from the shared [`RdbIO`]
+//! trait (defined in the `rdb_io` crate, re-exported here); this crate owns
+//! the trie-specific substrate on top of it — [`RdbOpts`], [`RdbError`], the
 //! NUL-framing helpers, and the [`load_with`] entry-stream reader — plus the
 //! [`TrieEntry`] value type it serializes. The two concrete serializers live
 //! alongside it:
@@ -20,10 +21,10 @@
 //! - [`mod@str`] — for the UTF-8-keyed [`trie_rs::str_trie_map::StrTrieMap`]`<TrieEntry>`,
 //!   a thin wrapper that delegates to [`byte`] and is byte-identical on the wire.
 //!
-//! IO is abstracted behind the [`RdbIO`] trait so this crate
-//! carries no Redis dependency: the C entrypoint implements it over
-//! `RedisModuleIO` (in the `trie_rdb_ffi` crate), and pure-Rust callers can
-//! implement it over any buffer.
+//! IO is abstracted behind the [`RdbIO`] trait, so the algorithm is generic
+//! over the endpoint: the C entrypoint (in the `trie_rdb_ffi` crate) drives it
+//! over `RedisModuleIO` via the `rdb_io` impl, and pure-Rust callers can drive
+//! it over any buffer.
 //!
 //! # Wire format
 //!
@@ -71,6 +72,7 @@ pub mod str;
 use std::io;
 
 pub use entry::TrieEntry;
+pub use rdb_io::RdbIO;
 
 /// Read the entry stream shared by both key flavors and feed each decoded
 /// entry to `insert`.
@@ -90,16 +92,16 @@ pub(crate) fn load_with<IO, K>(
 where
     IO: RdbIO,
 {
-    let count = reader.load_u64()?;
+    let count = reader.read_u64()?;
     for _ in 0..count {
         let key = key_from_bytes(load_nul_terminated(reader)?)?;
-        let score = reader.load_f64()?;
+        let score = reader.read_f64()?;
         let payload = opts
             .payloads
             .then(|| load_nul_terminated(reader))
             .transpose()?
             .filter(|b| !b.is_empty());
-        let num_docs = if opts.num_docs { reader.load_u64()? } else { 0 };
+        let num_docs = if opts.num_docs { reader.read_u64()? } else { 0 };
         insert(
             key,
             TrieEntry {
@@ -124,7 +126,7 @@ pub(crate) fn save_nul_terminated<IO: RdbIO>(writer: &mut IO, scratch: &mut Vec<
     scratch.reserve(b.len() + 1);
     scratch.extend_from_slice(b);
     scratch.push(0);
-    writer.save_bytes(scratch);
+    writer.write_buffer(scratch);
 }
 
 /// Read one length-prefixed buffer that is expected to end in a NUL byte
@@ -132,7 +134,7 @@ pub(crate) fn save_nul_terminated<IO: RdbIO>(writer: &mut IO, scratch: &mut Vec<
 /// [`RdbError::MissingTrailingNul`] when the wire buffer is empty or does
 /// not end in `0x00`.
 pub(crate) fn load_nul_terminated<IO: RdbIO>(reader: &mut IO) -> Result<Vec<u8>, RdbError> {
-    let mut buf = reader.load_bytes()?;
+    let mut buf = reader.read_buffer()?;
     if buf.pop() != Some(0) {
         return Err(RdbError::MissingTrailingNul);
     }
@@ -150,47 +152,6 @@ pub struct RdbOpts {
     pub payloads: bool,
     /// Persist each entry's `num_docs`.
     pub num_docs: bool,
-}
-
-/// Typed RDB IO endpoint: the save and load primitives for one trie payload.
-///
-/// One method per primitive type — `RedisModule_Save*` / `Load*` is a typed
-/// framing API (length-prefixed buffers, fixed-width numbers) rather than a
-/// byte stream, so [`std::io::Write`] / [`std::io::Read`] would not be a
-/// faithful abstraction.
-///
-/// Read and write live on one trait, not a split pair, because every
-/// implementor is bidirectional: the sole production impl wraps a single
-/// `RedisModuleIO` handle (passed to both the save and load callbacks), and
-/// the test mock round-trips through one buffer. Interface segregation would
-/// only pay off if a one-directional concrete type existed; none does. If a
-/// future call site genuinely needs a save-only or load-only bound, express it
-/// with a narrow local trait at that site rather than re-splitting `RdbIO`.
-///
-/// Saves are infallible, mirroring the void-returning `RedisModule_Save*`
-/// primitives (failures surface out-of-band via `RedisModule_IsIOError`).
-/// Loads return [`std::io::Result`]: the trait models raw IO, so the only
-/// failure at this layer is an IO error. Framing failures
-/// ([`RdbError::MissingTrailingNul`], [`RdbError::InvalidUtf8`]) are raised
-/// one layer up, by the helpers that consume these primitives.
-pub trait RdbIO {
-    /// Write a 64-bit unsigned integer.
-    fn save_u64(&mut self, v: u64);
-    /// Write a 64-bit IEEE-754 double.
-    fn save_f64(&mut self, v: f64);
-    /// Write `b` as a single length-prefixed buffer. Any NUL padding the
-    /// wire format requires is applied by the caller before this is
-    /// invoked (see [`save_nul_terminated`]).
-    fn save_bytes(&mut self, b: &[u8]);
-
-    /// Read a 64-bit unsigned integer.
-    fn load_u64(&mut self) -> io::Result<u64>;
-    /// Read a 64-bit IEEE-754 double.
-    fn load_f64(&mut self) -> io::Result<f64>;
-    /// Read one length-prefixed buffer and return its raw bytes. The caller
-    /// applies any trailing-NUL stripping the wire format requires (see
-    /// [`load_nul_terminated`]).
-    fn load_bytes(&mut self) -> io::Result<Vec<u8>>;
 }
 
 /// Errors that can occur while reading a trie RDB payload.
@@ -289,34 +250,50 @@ pub(crate) mod test_helpers {
         }
     }
 
+    // The trie RDB wire format only ever uses u64/f64/buffer; the `i64`/`f32`
+    // methods of the shared `RdbIO` trait exist for other consumers (e.g. RSE's
+    // vecsim) and are never reached by `trie_rdb`'s serializers, so the mock
+    // asserts that invariant rather than modeling them.
     impl RdbIO for RdbMock {
-        fn save_u64(&mut self, v: u64) {
+        fn write_u64(&mut self, v: u64) {
             self.ops.push(Op::U64(v));
         }
-        fn save_f64(&mut self, v: f64) {
+        fn write_f64(&mut self, v: f64) {
             self.ops.push(Op::F64(v));
         }
-        fn save_bytes(&mut self, b: &[u8]) {
+        fn write_buffer(&mut self, b: &[u8]) {
             self.ops.push(Op::Bytes(b.to_vec()));
         }
+        fn write_i64(&mut self, _v: i64) {
+            unreachable!("trie_rdb never serializes i64");
+        }
+        fn write_f32(&mut self, _v: f32) {
+            unreachable!("trie_rdb never serializes f32");
+        }
 
-        fn load_u64(&mut self) -> io::Result<u64> {
+        fn read_u64(&mut self) -> io::Result<u64> {
             match self.next_read()? {
                 Op::U64(v) => Ok(v),
                 op => panic!("mock: expected U64, got {op:?}"),
             }
         }
-        fn load_f64(&mut self) -> io::Result<f64> {
+        fn read_f64(&mut self) -> io::Result<f64> {
             match self.next_read()? {
                 Op::F64(v) => Ok(v),
                 op => panic!("mock: expected F64, got {op:?}"),
             }
         }
-        fn load_bytes(&mut self) -> io::Result<Vec<u8>> {
+        fn read_buffer(&mut self) -> io::Result<Vec<u8>> {
             match self.next_read()? {
                 Op::Bytes(v) => Ok(v),
                 op => panic!("mock: expected Bytes, got {op:?}"),
             }
+        }
+        fn read_i64(&mut self) -> io::Result<i64> {
+            unreachable!("trie_rdb never deserializes i64");
+        }
+        fn read_f32(&mut self) -> io::Result<f32> {
+            unreachable!("trie_rdb never deserializes f32");
         }
     }
 }

@@ -9,25 +9,21 @@
 
 //! FFI transport for the lex-mode trie RDB serialization.
 //!
-//! Bridges the pure-Rust framing in [`trie_rdb`] to Redis' RDB IO
-//! primitives (`RedisModule_SaveUnsigned`, `RedisModule_LoadStringBuffer`,
-//! and friends), driven through the ergonomic [`redis_module::RedisModuleIO`]
-//! wrapper and its `read_*` / `write_*` methods.
-//!
-//! [`trie_rdb`] models save/load as the single [`RdbIO`] trait; this crate
-//! supplies one impl ([`RmIoBridge`]) backed by a
-//! [`redis_module::RedisModuleIO`] wrapping the caller's `*mut RedisModuleIO`.
-//! The `extern "C"` entry points below let C callers drive the round-trip
-//! without touching the Rust generics.
+//! Bridges the pure-Rust framing in [`trie_rdb`] to Redis' RDB IO primitives
+//! (`RedisModule_SaveUnsigned`, `RedisModule_LoadStringBuffer`, and friends).
+//! [`trie_rdb`]'s serializers are generic over the shared `rdb_io::RdbIO`
+//! trait, and the `rdb_io` crate implements that trait directly for
+//! [`redis_module::RedisModuleIO`]. So each `extern "C"` entry point below just
+//! wraps the caller's `*mut RedisModuleIO` in a [`redis_module::RedisModuleIO`]
+//! and hands it to the generic serializer — no per-crate bridge type is needed.
 
 #![allow(non_camel_case_types, non_snake_case)]
 
 use ffi::RedisModuleIO;
 use redis_module::{RedisModuleIO as RmIo, raw};
-use std::io;
+use trie_rdb::RdbOpts;
 use trie_rdb::TrieEntry;
 use trie_rdb::str as str_rdb;
-use trie_rdb::{RdbIO, RdbOpts};
 use trie_rs::str_trie_map::StrTrieMap;
 
 /// Opaque FFI handle for a [`StrTrieMap<TrieEntry>`].
@@ -38,54 +34,6 @@ use trie_rs::str_trie_map::StrTrieMap;
 /// surface as `NULL` from [`LexTrieRs_RdbLoad`]. Construct via
 /// [`LexTrieRs_New`] or [`LexTrieRs_RdbLoad`]; free via [`LexTrieRs_Free`].
 pub struct LexTrieRs(pub StrTrieMap<TrieEntry>);
-
-/// [`RdbIO`] backed by a [`RmIo`] wrapping the caller's `RedisModuleIO*`.
-///
-/// A single bidirectional bridge, matching the one `RedisModuleIO` handle it
-/// wraps: the same handle drives both the save and load callbacks, so both
-/// directions live on one struct. The wrapper holds the raw pointer captured
-/// at construction and never stores it anywhere else. Validity is the
-/// caller's responsibility (see the `Safety` blocks on the `extern "C"` entry
-/// points below).
-///
-/// On save, NUL framing and the scratch buffer that amortizes its allocation
-/// are owned by [`trie_rdb::byte::save`]; this impl just forwards each slice
-/// straight to `RedisModule_SaveStringBuffer` via [`RmIo::write_slice`]. On
-/// load, the wrapped `read_*` methods already poll `RedisModule_IsIOError`
-/// after each underlying `RedisModule_Load*` and surface failures as `Err`, so
-/// we do not need a separate `IsIOError` check.
-struct RmIoBridge {
-    io: RmIo,
-}
-
-impl RdbIO for RmIoBridge {
-    fn save_u64(&mut self, v: u64) {
-        self.io.write_unsigned(v);
-    }
-
-    fn save_f64(&mut self, v: f64) {
-        self.io.write_double(v);
-    }
-
-    fn save_bytes(&mut self, b: &[u8]) {
-        self.io.write_slice(b);
-    }
-
-    fn load_u64(&mut self) -> io::Result<u64> {
-        self.io.read_unsigned().map_err(io::Error::other)
-    }
-
-    fn load_f64(&mut self) -> io::Result<f64> {
-        self.io.read_double().map_err(io::Error::other)
-    }
-
-    fn load_bytes(&mut self) -> io::Result<Vec<u8>> {
-        self.io
-            .read_string_buffer()
-            .map(|buf| buf.as_ref().to_vec())
-            .map_err(io::Error::other)
-    }
-}
 
 /// Allocate an empty [`LexTrieRs`] on the Rust heap.
 ///
@@ -141,14 +89,12 @@ pub unsafe extern "C" fn LexTrieRs_RdbSave(
     // SAFETY: caller guarantees `map` is a valid `*const LexTrieRs`
     // and that no aliasing mutable references exist for the call.
     let map = unsafe { &*map };
-    let mut bridge = RmIoBridge {
-        io: RmIo::new(io.cast::<raw::RedisModuleIO>()),
-    };
+    let mut rm_io = RmIo::new(io.cast::<raw::RedisModuleIO>());
     let opts = RdbOpts {
         payloads: save_payloads,
         num_docs: save_num_docs,
     };
-    str_rdb::save(&map.0, &mut bridge, opts);
+    str_rdb::save(&map.0, &mut rm_io, opts);
 }
 
 /// Deserialize a [`LexTrieRs`] from `io` in the lex-mode RDB wire format.
@@ -173,14 +119,12 @@ pub unsafe extern "C" fn LexTrieRs_RdbLoad(
 ) -> *mut LexTrieRs {
     debug_assert!(!io.is_null(), "io cannot be NULL");
 
-    let mut bridge = RmIoBridge {
-        io: RmIo::new(io.cast::<raw::RedisModuleIO>()),
-    };
+    let mut rm_io = RmIo::new(io.cast::<raw::RedisModuleIO>());
     let opts = RdbOpts {
         payloads: load_payloads,
         num_docs: load_num_docs,
     };
-    match str_rdb::load(&mut bridge, opts) {
+    match str_rdb::load(&mut rm_io, opts) {
         Ok(map) => Box::into_raw(Box::new(LexTrieRs(map))),
         Err(_) => std::ptr::null_mut(),
     }

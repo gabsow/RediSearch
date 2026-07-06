@@ -25,16 +25,16 @@ use trie_rs::TrieMap;
 /// buffer is reused across all entries so the per-key NUL padding costs
 /// at most one allocation per save call.
 pub fn save<IO: RdbIO>(map: &TrieMap<TrieEntry>, io: &mut IO, opts: RdbOpts) {
-    io.save_u64(map.n_unique_keys() as u64);
+    io.write_u64(map.n_unique_keys() as u64);
     let mut scratch = Vec::new();
     for (key, entry) in map.iter() {
         save_nul_terminated(io, &mut scratch, &key);
-        io.save_f64(entry.score);
+        io.write_f64(entry.score);
         if opts.payloads {
             save_nul_terminated(io, &mut scratch, entry.payload.as_deref().unwrap_or(&[]));
         }
         if opts.num_docs {
-            io.save_u64(entry.num_docs);
+            io.write_u64(entry.num_docs);
         }
     }
 }
