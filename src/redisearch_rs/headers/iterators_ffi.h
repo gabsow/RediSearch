@@ -107,6 +107,8 @@ typedef struct NumericRangeTree NumericRangeTree;
 
 typedef struct RLookupKey RLookupKey;
 
+typedef struct RedisModuleCtx RedisModuleCtx;
+
 /**
  * Results returned by a [`ProduceResultsFn`].
  *
@@ -506,7 +508,7 @@ QueryIterator *NewLazyVectorRangeIterator(ProduceResultsFn produce, FreeProducer
  * 2. `root` must be null or a valid pointer to a [`QueryIterator`] tree
  *    that has been profile-wrapped via `Profile_AddIters`.
  */
-void Profile_PrintIterators(RedisModuleCtx *ctx, const QueryIterator *root, bool limited, bool print_profile_clock);
+void Profile_PrintIterators(struct RedisModuleCtx *ctx, const QueryIterator *root, bool limited, bool print_profile_clock);
 
 /**
  * Opens the numeric/geo index and creates an iterator over all matching sub-ranges.
