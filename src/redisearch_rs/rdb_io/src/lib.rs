@@ -178,64 +178,6 @@ impl RdbIO for RedisModuleIO {
     }
 }
 
-/// Read-only [`RdbIO`] impl backed by a borrowed byte slice.
-///
-/// Used in tests to drive deserialize against in-memory byte slices without
-/// copying them into a `Vec<u8>`. The write methods are unreachable — only
-/// call this impl from contexts that purely read.
-impl RdbIO for &mut Cursor<&[u8]> {
-    fn read_u64(&mut self) -> Result<u64> {
-        let mut buf = [0u8; 8];
-        self.read_exact(&mut buf)?;
-        Ok(u64::from_le_bytes(buf))
-    }
-
-    fn read_i64(&mut self) -> Result<i64> {
-        let mut buf = [0u8; 8];
-        self.read_exact(&mut buf)?;
-        Ok(i64::from_le_bytes(buf))
-    }
-
-    fn read_f64(&mut self) -> Result<f64> {
-        let mut buf = [0u8; 8];
-        self.read_exact(&mut buf)?;
-        Ok(f64::from_le_bytes(buf))
-    }
-
-    fn read_f32(&mut self) -> Result<f32> {
-        let mut buf = [0u8; 4];
-        self.read_exact(&mut buf)?;
-        Ok(f32::from_le_bytes(buf))
-    }
-
-    fn read_buffer(&mut self) -> Result<Vec<u8>> {
-        let len = self.read_u64()? as usize;
-        let mut buffer = vec![0u8; len];
-        self.read_exact(&mut buffer)?;
-        Ok(buffer)
-    }
-
-    fn write_u64(&mut self, _value: u64) {
-        unreachable!("RdbIO::write_u64 called on read-only &[u8] cursor");
-    }
-
-    fn write_i64(&mut self, _value: i64) {
-        unreachable!("RdbIO::write_i64 called on read-only &[u8] cursor");
-    }
-
-    fn write_f64(&mut self, _value: f64) {
-        unreachable!("RdbIO::write_f64 called on read-only &[u8] cursor");
-    }
-
-    fn write_f32(&mut self, _value: f32) {
-        unreachable!("RdbIO::write_f32 called on read-only &[u8] cursor");
-    }
-
-    fn write_buffer(&mut self, _buffer: &[u8]) {
-        unreachable!("RdbIO::write_buffer called on read-only &[u8] cursor");
-    }
-}
-
 // This implementation allows us to use a Cursor over a Vec<u8> for testing purposes,
 impl RdbIO for &mut Cursor<&mut Vec<u8>> {
     fn read_u64(&mut self) -> Result<u64> {
@@ -300,15 +242,17 @@ impl RdbIO for &mut Cursor<&mut Vec<u8>> {
 mod tests {
     use super::*;
 
-    /// Round-trip every primitive through the `Cursor` impls: write into a
-    /// `Vec<u8>`-backed cursor, then read the same values back out of a
-    /// slice-backed cursor. Covers the test-only `Cursor` impls that no OSS
-    /// caller otherwise exercises (`trie_rdb` uses its own `RdbMock`).
+    /// Round-trip every primitive through the `Cursor<&mut Vec<u8>>` impl:
+    /// write into the cursor, rewind, then read the same values back out. This
+    /// is the sole test-only `Cursor` impl (the read-only `&[u8]` impl was
+    /// dropped) and no OSS caller otherwise exercises it — `trie_rdb` uses its
+    /// own `RdbMock`.
     #[test]
     fn cursor_round_trip_all_primitives() {
         let mut backing = Vec::new();
+        let mut cur = Cursor::new(&mut backing);
+
         {
-            let mut cur = Cursor::new(&mut backing);
             let mut io = &mut cur;
             io.write_u64(42);
             io.write_i64(-7);
@@ -317,7 +261,8 @@ mod tests {
             io.write_buffer(b"hello");
         }
 
-        let mut cur = Cursor::new(backing.as_slice());
+        cur.set_position(0);
+
         let mut io = &mut cur;
         assert_eq!(io.read_u64().unwrap(), 42);
         assert_eq!(io.read_i64().unwrap(), -7);
@@ -336,13 +281,15 @@ mod tests {
         }
 
         let mut backing = Vec::new();
+        let mut cur = Cursor::new(&mut backing);
+
         {
-            let mut cur = Cursor::new(&mut backing);
             let mut io = &mut cur; // impls RdbIO directly
             write_one(&mut io); // &mut io exercises the &mut T blanket impl
         }
 
-        let mut cur = Cursor::new(backing.as_slice());
+        cur.set_position(0);
+
         let mut io = &mut cur;
         assert_eq!(io.read_u64().unwrap(), 99);
     }
