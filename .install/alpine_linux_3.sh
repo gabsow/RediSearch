@@ -28,8 +28,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/install_llvm.sh" $MODE
 
 # Static LLVM/clang libraries for bindgen-static mode (redis-module musl target
 # in document_metadata uses bindgen-static, which links clang-sys statically).
+# compiler-rt: the python test venv builds its sdist-only deps with clang
+# (see test_deps/install_python_deps.sh), whose baked-in --rtlib=compiler-rt
+# needs the runtime present.
 LLVM_VER=$(ls /usr/lib/ | grep -oE 'llvm[0-9]+' | sort -V | tail -1 | tr -d 'llvm')
-$MODE apk add --no-cache llvm${LLVM_VER}-static ncurses-static zlib-static zstd-static
+$MODE apk add --no-cache llvm${LLVM_VER}-static ncurses-static zlib-static zstd-static compiler-rt
 
 # Alpine ships component .a files but no combined libLLVM-<ver>.a.
 # clang-sys emits cargo:rustc-link-lib=LLVM-<ver> which the linker resolves to
