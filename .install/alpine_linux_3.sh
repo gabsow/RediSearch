@@ -33,10 +33,16 @@ $MODE apk add --no-cache llvm${LLVM_VER}-static ncurses-static zlib-static zstd-
 
 # Alpine ships component .a files but no combined libLLVM-<ver>.a.
 # clang-sys emits cargo:rustc-link-lib=LLVM-<ver> which the linker resolves to
-# libLLVM-<ver>.a. Create a thin archive that references the component files.
+# libLLVM-<ver>.a. GNU ar's thin-archive mode (`ar rcT`) flattens the nested
+# component archives into member headers ld.lld cannot parse ("could not get
+# the buffer for a child of the archive"), so provide a GROUP() linker script
+# instead — both ld.lld and GNU ld accept a text script in place of an
+# archive, and it costs no disk space.
 if [ ! -e /usr/lib/llvm${LLVM_VER}/lib/libLLVM-${LLVM_VER}.a ]; then
-    # shellcheck disable=SC2046
-    $MODE ar rcT /usr/lib/llvm${LLVM_VER}/lib/libLLVM-${LLVM_VER}.a \
-        /usr/lib/llvm${LLVM_VER}/lib/libLLVM*.a \
-        /usr/lib/libzstd.a
+    # Expand the glob before tee creates the output file, so the combined
+    # archive never lists itself.
+    # shellcheck disable=SC2086
+    LLVM_COMPONENT_LIBS=$(echo /usr/lib/llvm${LLVM_VER}/lib/libLLVM*.a /usr/lib/libzstd.a)
+    echo "GROUP( ${LLVM_COMPONENT_LIBS} )" \
+        | $MODE tee /usr/lib/llvm${LLVM_VER}/lib/libLLVM-${LLVM_VER}.a > /dev/null
 fi
