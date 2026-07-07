@@ -29,6 +29,17 @@ activate_venv() {
 	fi
 }
 
+# On musl (Alpine), uv's downloaded standalone CPython is clang-built and
+# bakes clang-only flags (--rtlib=compiler-rt) into its sysconfig, so
+# sdist-only deps (ml-dtypes, psutil) fail to compile with the system gcc.
+# Use the distro's own python3 instead (alpine_linux_3.sh installs
+# python3 + python3-dev for the headers).
+if [[ -f /etc/alpine-release ]]; then
+    UV_PYTHON="$(command -v python3)"
+    export UV_PYTHON
+    export UV_PYTHON_DOWNLOADS=never
+fi
+
 # Create a virtual environment for Python tests, with `pip` pre-installed (--seed).
 # --clear ensures a partial .venv left behind by a failed (e.g. network-timed-out)
 # attempt is replaced rather than causing "virtual environment already exists" on retry.
